@@ -431,7 +431,7 @@ def invokeRealCompiler(compilerBinary, cmdLine, captureOutput=False):
     output = None
     if captureOutput:
         compilerProcess = Popen(realCmdline, stdout=PIPE, stderr=STDOUT)
-        output = compilerProcess.communicate()[0]
+        output = compilerProcess.communicate()[0].replace('\r\n','\n')
         returnCode = compilerProcess.returncode
     else:
         returnCode = subprocess.call(realCmdline)
