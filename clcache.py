@@ -58,6 +58,8 @@ class ObjectCache:
         return self.dir
 
     def clean(self, stats, maximumSize):
+        # Ensure other processes will not touch cache during cleaning
+        stats.ensureLoadedAndLocked()
         currentSize = stats.currentCacheSize()
         if currentSize < maximumSize:
             return
@@ -181,8 +183,78 @@ class Configuration:
 
 
 class CacheStatistics:
-    def __init__(self, objectCache):
-        self._stats = PersistentJSONDict(os.path.join(objectCache.cacheDirectory(),
+    def __init__(self, objectCache, cacheLock):
+        # Use two dictionaries to ensure we'll grab cache lock on the smallest
+        # possible time. We collect increment _incremental_stats while possible
+        # and then merge it with stats on disk.
+        self._incremental_stats = defaultdict(int)
+        self._stats = None
+        self._cacheLock = cacheLock
+        self._objectCache = objectCache
+
+    def numCallsWithoutSourceFile(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithoutSourceFile"]
+
+    def registerCallWithoutSourceFile(self):
+        self._incremental_stats["CallsWithoutSourceFile"] += 1
+
+    def numCallsWithMultipleSourceFiles(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithMultipleSourceFiles"]
+
+    def registerCallWithMultipleSourceFiles(self):
+        self._incremental_stats["CallsWithMultipleSourceFiles"] += 1
+
+    def numCallsWithPch(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithPch"]
+
+    def registerCallWithPch(self):
+        self._incremental_stats["CallsWithPch"] += 1
+
+    def numCallsForLinking(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsForLinking"]
+
+    def registerCallForLinking(self):
+        self._incremental_stats["CallsForLinking"] += 1
+
+    def numCacheEntries(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheEntries"]
+
+    def registerCacheEntry(self, size):
+        self._incremental_stats["CacheEntries"] += 1
+        self._incremental_stats["CacheSize"] += size
+
+    def currentCacheSize(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheSize"]
+
+    def setCacheSize(self, size):
+        self.ensureLoadedAndLocked()
+        self._stats["CacheSize"] = size
+
+    def numCacheHits(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheHits"]
+
+    def registerCacheHit(self):
+        self._incremental_stats["CacheHits"] += 1
+
+    def numCacheMisses(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheMisses"]
+
+    def registerCacheMiss(self):
+        self._incremental_stats["CacheMisses"] += 1
+
+    def ensureLoadedAndLocked(self):
+        if self._stats:
+            return
+        self._cacheLock.acquire()
+        self._stats = PersistentJSONDict(os.path.join(self._objectCache.cacheDirectory(),
                                                       "stats.txt"))
         for k in ["CallsWithoutSourceFile",
                   "CallsWithMultipleSourceFiles",
@@ -192,58 +264,17 @@ class CacheStatistics:
                   "CacheHits", "CacheMisses"]:
             if not k in self._stats:
                 self._stats[k] = 0
-
-    def numCallsWithoutSourceFile(self):
-        return self._stats["CallsWithoutSourceFile"]
-
-    def registerCallWithoutSourceFile(self):
-        self._stats["CallsWithoutSourceFile"] += 1
-
-    def numCallsWithMultipleSourceFiles(self):
-        return self._stats["CallsWithMultipleSourceFiles"]
-
-    def registerCallWithMultipleSourceFiles(self):
-        self._stats["CallsWithMultipleSourceFiles"] += 1
-
-    def numCallsWithPch(self):
-        return self._stats["CallsWithPch"]
-
-    def registerCallWithPch(self):
-        self._stats["CallsWithPch"] += 1
-
-    def numCallsForLinking(self):
-        return self._stats["CallsForLinking"]
-
-    def registerCallForLinking(self):
-        self._stats["CallsForLinking"] += 1
-
-    def numCacheEntries(self):
-        return self._stats["CacheEntries"]
-
-    def registerCacheEntry(self, size):
-        self._stats["CacheEntries"] += 1
-        self._stats["CacheSize"] += size
-
-    def currentCacheSize(self):
-        return self._stats["CacheSize"]
-
-    def setCacheSize(self, size):
-        self._stats["CacheSize"] = size
-
-    def numCacheHits(self):
-        return self._stats["CacheHits"]
-
-    def registerCacheHit(self):
-        self._stats["CacheHits"] += 1
-
-    def numCacheMisses(self):
-        return self._stats["CacheMisses"]
-
-    def registerCacheMiss(self):
-        self._stats["CacheMisses"] += 1
+        for key, value in self._incremental_stats.items():
+            self._stats[key] += value
+        self._incremental_stats = defaultdict(int)
 
     def save(self):
+        self.ensureLoadedAndLocked()
         self._stats.save()
+        self._cacheLock.release()
+        self._stats = None  # Force reload stats when we'll re-acuire lock
+
+
 
 class AnalysisResult:
     Ok, NoSourceFile, MultipleSourceFilesSimple, \
@@ -541,7 +572,7 @@ def reinvokePerSourceFile(cmdLine, sourceFiles):
 
 def printStatistics():
     cache = ObjectCache()
-    stats = CacheStatistics(cache)
+    stats = CacheStatistics(cache, cacheLock(cache))
     cfg = Configuration(cache)
     print """clcache statistics:
   current cache dir        : %s
@@ -605,8 +636,9 @@ if analysisResult == AnalysisResult.MultipleSourceFilesSimple:
     sys.exit(reinvokePerSourceFile(cmdLine, sourceFile))
 
 cache = ObjectCache()
-stats = CacheStatistics(cache)
 lock = cacheLock(cache)
+stats = CacheStatistics(cache, lock)
+
 if analysisResult != AnalysisResult.Ok:
     if analysisResult == AnalysisResult.NoSourceFile:
         printTraceStatement("Cannot cache invocation as %s: no source file found" % (' '.join(cmdLine)) )
