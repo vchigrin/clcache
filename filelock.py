@@ -34,8 +34,10 @@ class FileLock(object):
                 self.fd = os.open(self.lockfile, os.O_CREAT|os.O_EXCL|os.O_RDWR)
                 break;
             except OSError as e:
-                if e.errno != errno.EEXIST:
-                    raise 
+                # Seems, sometimes we get here EACCESS on Windows 7 instead of
+                # EEXIST
+                if e.errno != errno.EEXIST and e.errno != errno.EACCES:
+                    raise
                 if (time.time() - start_time) >= self.timeout:
                     raise FileLockException("Timeout occured.")
                 time.sleep(self.delay)
