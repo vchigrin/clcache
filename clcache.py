@@ -684,30 +684,40 @@ def resetStatistics():
   stats.save()
   print 'Statistics reset'
 
-def preprocessFile(compilerBinary, commandLine, sourceFile, cache):
-    preprocessedFilePath = cache.getTempFilePath(sourceFile)
-    ppcmd = [compilerBinary, "/P", "/Fi" + preprocessedFilePath]
+def parsePreprocessorOutput(preprocessorOutput, sourceFile):
+    includesSet = set([])
+    reFilePath = re.compile('^#line \\d+ \\"?(?P<file_path>[^\\"]+)\\"?$')
+    absSourceFile = os.path.abspath(sourceFile)
+    # TODO: Add support for CCACHE_BASEDIR to allow cache hits when repo dir is renamed.
+    for line in preprocessorOutput:
+        match = reFilePath.match(line.rstrip('\r\n'))
+        if match is not None:
+            filePath = match.group('file_path').replace('\\\\', '\\')
+            if filePath != absSourceFile:
+                includesSet.add(filePath)
+    return list(includesSet)
+
+def preprocessFile(compilerBinary, commandLine, sourceFile, cache, captureOutput=False):
+    preprocessedFilePath = None
+    if captureOutput:
+        preprocessedFilePath = cache.getTempFilePath(sourceFile)
+        ppcmd = [compilerBinary, "/P", "/Fi" + preprocessedFilePath]
+    else:
+        ppcmd = [compilerBinary, "/E"]
     ppcmd += [arg for arg in commandLine[1:] if not arg in ("-c", "/c")]
     preprocessor = Popen(ppcmd, stdout=PIPE, stderr=PIPE)
     (ppout, pperr) = preprocessor.communicate()
 
     if preprocessor.returncode != 0:
-        sys.stdout.write(ppout)
         sys.stderr.write(pperr)
         sys.stderr.write("clcache: preprocessor failed\n")
         sys.exit(preprocessor.returncode)
-    includesSet = set([])
-    reFilePath = re.compile('^#line \\d+ \\"?(?P<file_path>[^\\"]+)\\"?$')
-    absSourceFile = os.path.abspath(sourceFile)
-    # TODO: Add support for CCACHE_BASEDIR to allow cache hits when repo dir is renamed.
-    with open(preprocessedFilePath, 'r') as inFile:
-        for line in inFile:
-            match = reFilePath.match(line)
-            if match is not None:
-                filePath = match.group('file_path').replace('\\\\', '\\')
-                if filePath != absSourceFile:
-                    includesSet.add(filePath)
-    return preprocessedFilePath, list(includesSet)
+    if captureOutput:
+        with open(preprocessedFilePath, 'r') as inFile:
+            listOfIncludes = parsePreprocessorOutput(inFile, sourceFile)
+    else:
+        listOfIncludes = parsePreprocessorOutput(ppout.split('\n'), sourceFile)
+    return listOfIncludes, preprocessedFilePath
 
 def addObjectToCache(cache, outputFile, compilerOutput, cachekey):
     printTraceStatement("Adding file " + outputFile + " to cache using " +
@@ -756,15 +766,18 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
 
 def processNoManifestMiss(stats, cache, outputFile, manifestHash, compiler, cmdLine):
     stats.registerSourceChangedMiss()
-    preprocessedFile, listOfIncludes = preprocessFile(compiler, cmdLine, sourceFile, cache)
+    singlePreprocess = not 'CLCACHE_CPP2' in os.environ
+    listOfIncludes, preprocessedFile = preprocessFile(compiler, cmdLine, sourceFile, cache, singlePreprocess)
     manifest = Manifest(listOfIncludes, {})
     listOfHashes = [getFileHash(fileName) for fileName in listOfIncludes]
     includesKey = getHash(','.join(listOfHashes))
-    index = cmdLine.index(sourceFile)
-    cmdLine[index] = preprocessedFile
+    if singlePreprocess:
+        index = cmdLine.index(sourceFile)
+        cmdLine[index] = preprocessedFile
     cachekey = getHash(includesKey)
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
-    os.remove(preprocessedFile)
+    if singlePreprocess:
+        os.remove(preprocessedFile)
     if returnCode == 0 and os.path.exists(outputFile):
         addObjectToCache(cache, outputFile, compilerOutput, cachekey)
         manifest.hashes[includesKey] = cachekey
