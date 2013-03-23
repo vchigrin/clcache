@@ -41,7 +41,7 @@ import multiprocessing
 import re
 
 def cacheLock(cache):
-    lock = FileLock("x", timeout=2)
+    lock = FileLock("x", timeout=100)
     lock.lockfile = os.path.join(cache.cacheDirectory(), "cache.lock")
     return lock
 
@@ -63,6 +63,9 @@ class ObjectCache:
         currentSize = stats.currentCacheSize()
         if currentSize < maximumSize:
             return
+        # Free at least 10% to avoid too often cleanups and performance degradation
+        # on large caches.
+        maxSizeAfterCleanup = maximumSize * 0.9
 
         objects = [os.path.join(root, "object")
                    for root, folder, files in os.walk(self.dir)
@@ -70,13 +73,11 @@ class ObjectCache:
 
         objectInfos = [(os.stat(fn), fn) for fn in objects]
         objectInfos.sort(key=lambda t: t[0].st_atime, reverse=True)
-
         for stat, fn in objectInfos:
             rmtree(os.path.split(fn)[0])
             currentSize -= stat.st_size
-            if currentSize < maximumSize:
+            if currentSize < maxSizeAfterCleanup:
                 break
-
         stats.setCacheSize(currentSize)
 
     def computeKey(self, compilerBinary, commandLine):
