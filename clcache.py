@@ -37,6 +37,7 @@ from shutil import copyfile, rmtree
 import subprocess
 from subprocess import Popen, PIPE, STDOUT
 import sys
+import tempfile
 import multiprocessing
 import re
 
@@ -51,8 +52,10 @@ class ObjectCache:
             self.dir = os.environ["CLCACHE_DIR"]
         except KeyError:
             self.dir = os.path.join(os.path.expanduser("~"), "clcache")
-        if not os.path.exists(self.dir):
-            os.makedirs(self.dir)
+        self.tempDir = os.path.join(self.dir, '.temp')
+        # Creates both self.dir and self.tempDir if neccessary
+        if not os.path.exists(self.tempDir):
+            os.makedirs(self.tempDir)
 
     def cacheDirectory(self):
         return self.dir
@@ -80,13 +83,15 @@ class ObjectCache:
                 break
         stats.setCacheSize(currentSize)
 
-    def computeKey(self, compilerBinary, commandLine):
-        ppcmd = [compilerBinary, "/EP"]
+    def getKeyAndPreprocessedFile(self, compilerBinary, commandLine, sourceFile):
+        preprocessedFilePath = self._getTempFilePath(sourceFile)
+        ppcmd = [compilerBinary, "/P", "/Fi" + preprocessedFilePath]
         ppcmd += [arg for arg in commandLine[1:] if not arg in ("-c", "/c")]
         preprocessor = Popen(ppcmd, stdout=PIPE, stderr=PIPE)
-        (preprocessedSourceCode, pperr) = preprocessor.communicate()
+        (ppout, pperr) = preprocessor.communicate()
 
         if preprocessor.returncode != 0:
+            sys.stdout.write(ppout)
             sys.stderr.write(pperr)
             sys.stderr.write("clcache: preprocessor failed\n")
             sys.exit(preprocessor.returncode)
@@ -98,8 +103,9 @@ class ObjectCache:
         sha.update(str(stat.st_mtime))
         sha.update(str(stat.st_size))
         sha.update(' '.join(normalizedCmdLine))
-        sha.update(preprocessedSourceCode)
-        return sha.hexdigest()
+        with open(preprocessedFilePath, 'rb') as inFile:
+            sha.update(inFile.read())
+        return sha.hexdigest(), preprocessedFilePath
 
     def hasEntry(self, key):
         return os.path.exists(self.cachedObjectName(key))
@@ -115,6 +121,12 @@ class ObjectCache:
 
     def cachedCompilerOutput(self, key):
         return open(self._cachedCompilerOutputName(key), 'r').read()
+
+    def _getTempFilePath(self, sourceFile):
+        ext =  os.path.splitext(sourceFile)[1]
+        handle, path = tempfile.mkstemp(suffix=ext, dir=self.tempDir)
+        os.close(handle)
+        return path
 
     def _cacheEntryDir(self, key):
         return os.path.join(self.dir, key[:2], key)
@@ -677,10 +689,11 @@ if analysisResult != AnalysisResult.Ok:
     stats.save()
     sys.exit(invokeRealCompiler(compiler, sys.argv[1:])[0])
 
-cachekey = cache.computeKey(compiler, cmdLine)
+cachekey, preprocessedFile = cache.getKeyAndPreprocessedFile(compiler, cmdLine, sourceFile)
 if cache.hasEntry(cachekey):
     stats.registerCacheHit()
     stats.save()
+    os.remove(preprocessedFile)
     printTraceStatement("Reusing cached object for key " + cachekey + " for " +
                         "output file " + outputFile)
     copyfile(cache.cachedObjectName(cachekey), outputFile)
@@ -689,7 +702,10 @@ if cache.hasEntry(cachekey):
     sys.exit(0)
 else:
     stats.registerCacheMiss()
+    index = cmdLine.index(sourceFile)
+    cmdLine[index] = preprocessedFile
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
+    os.remove(preprocessedFile)
     if returnCode == 0 and os.path.exists(outputFile):
         printTraceStatement("Adding file " + outputFile + " to cache using " +
                             "key " + cachekey)
