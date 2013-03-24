@@ -331,7 +331,7 @@ def splitCommandsFile(line):
         if line[i] == ' ' and not inside_quotes and wordStart >= 0:
             result.append(extractArgument(line, wordStart, i))
             wordStart = -1
-        if line[i] == '"' and i > 0 and line[i - 1] != '\\':
+        if line[i] == '"' and ((i == 0) or (i > 0 and line[i - 1] != '\\')):
             inside_quotes = not inside_quotes
         if line[i] != ' ' and wordStart < 0:
             wordStart = i
