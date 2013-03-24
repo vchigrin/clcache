@@ -271,6 +271,7 @@ class CacheStatistics:
         return self._stats["EvictedMisses"]
 
     def registerEvictedMiss(self):
+        self._registerCacheMiss()
         self._incremental_stats["EvictedMisses"] += 1
 
     def numHeaderChangedMisses(self):
@@ -278,6 +279,7 @@ class CacheStatistics:
         return self._stats["HeaderChangedMisses"]
 
     def registerHeaderChangedMiss(self):
+        self._registerCacheMiss()
         self._incremental_stats["HeaderChangedMisses"] += 1
 
     def numSourceChangedMisses(self):
@@ -285,6 +287,7 @@ class CacheStatistics:
         return self._stats["SourceChangedMisses"]
 
     def registerSourceChangedMiss(self):
+        self._registerCacheMiss()
         self._incremental_stats["SourceChangedMisses"] += 1
 
     def numCacheEntries(self):
@@ -314,7 +317,7 @@ class CacheStatistics:
         self.ensureLoadedAndLocked()
         return self._stats["CacheMisses"]
 
-    def registerCacheMiss(self):
+    def _registerCacheMiss(self):
         self._incremental_stats["CacheMisses"] += 1
 
     def ensureLoadedAndLocked(self):
