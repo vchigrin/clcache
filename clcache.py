@@ -49,6 +49,11 @@ Manifest = namedtuple('Manifest', ['includeFiles', 'hashes'])
 # manifests grow too large.
 MAX_MANIFEST_HASHES = 100
 
+# String, by which BASE_DIR will be replaced in paths, stored in manifests.
+# ? is invalid character for file name, so it seems ok
+# to use it as mark for relative path.
+BASEDIR_REPLACEMENT = '?'
+
 def cacheLock(cache):
     lock = FileLock("x", timeout=100)
     lock.lockfile = os.path.join(cache.cacheDirectory(), "cache.lock")
@@ -349,6 +354,14 @@ def getFileHash(filePath, additionalData = None):
     if additionalData is not None:
         sha.update(additionalData)
     return sha.hexdigest()
+
+def getRelFileHash(filePath, baseDir):
+    if filePath.startswith(BASEDIR_REPLACEMENT):
+        if not baseDir:
+            sys.stderr.write('No CLCACHE_BASEDIR set, but found relative path ' + filePath)
+            sys.exit(1)
+        filePath = filePath.replace(BASEDIR_REPLACEMENT, baseDir, 1)
+    return getFileHash(filePath)
 
 def getHash(data):
     sha = hashlib.sha1()
@@ -684,17 +697,21 @@ def resetStatistics():
   stats.save()
   print 'Statistics reset'
 
-def parsePreprocessorOutput(preprocessorOutput, sourceFile):
+def parsePreprocessorOutput(preprocessorOutput, sourceFile, baseDir):
     includesSet = set([])
     reFilePath = re.compile('^#line \\d+ \\"?(?P<file_path>[^\\"]+)\\"?$')
-    absSourceFile = os.path.abspath(sourceFile)
-    # TODO: Add support for CCACHE_BASEDIR to allow cache hits when repo dir is renamed.
+    absSourceFile = os.path.normcase(os.path.abspath(sourceFile))
+    if baseDir:
+        baseDir = os.path.normcase(baseDir)
     for line in preprocessorOutput:
         match = reFilePath.match(line.rstrip('\r\n'))
         if match is not None:
             filePath = match.group('file_path').replace('\\\\', '\\')
+            filePath = os.path.normcase(filePath)
             if filePath != absSourceFile:
                 if os.path.exists(filePath):
+                    if baseDir and filePath.startswith(baseDir):
+                        filePath = filePath.replace(baseDir, BASEDIR_REPLACEMENT, 1)
                     includesSet.add(filePath)
                 else:
                     # This can happen in cases, when source file already has
@@ -706,7 +723,8 @@ def parsePreprocessorOutput(preprocessorOutput, sourceFile):
                                      .format(filePath=filePath))
     return list(includesSet)
 
-def preprocessFile(compilerBinary, commandLine, sourceFile, cache, captureOutput=False):
+def preprocessFile(compilerBinary, commandLine, sourceFile,
+                   cache, captureOutput=False, baseDir=None):
     preprocessedFilePath = None
     if captureOutput:
         preprocessedFilePath = cache.getTempFilePath(sourceFile)
@@ -723,9 +741,9 @@ def preprocessFile(compilerBinary, commandLine, sourceFile, cache, captureOutput
         sys.exit(preprocessor.returncode)
     if captureOutput:
         with open(preprocessedFilePath, 'r') as inFile:
-            listOfIncludes = parsePreprocessorOutput(inFile, sourceFile)
+            listOfIncludes = parsePreprocessorOutput(inFile, sourceFile, baseDir)
     else:
-        listOfIncludes = parsePreprocessorOutput(ppout.split('\n'), sourceFile)
+        listOfIncludes = parsePreprocessorOutput(ppout.split('\n'), sourceFile, baseDir)
     return listOfIncludes, preprocessedFilePath
 
 def addObjectToCache(cache, outputFile, compilerOutput, cachekey):
@@ -773,12 +791,13 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
     printTraceStatement("Finished. Exit code %d" % returnCode)
     sys.exit(returnCode)
 
-def processNoManifestMiss(stats, cache, outputFile, manifestHash, compiler, cmdLine):
+def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine):
     stats.registerSourceChangedMiss()
     singlePreprocess = not 'CLCACHE_CPP2' in os.environ
-    listOfIncludes, preprocessedFile = preprocessFile(compiler, cmdLine, sourceFile, cache, singlePreprocess)
+    listOfIncludes, preprocessedFile = preprocessFile(compiler, cmdLine, sourceFile,
+                                                      cache, singlePreprocess, baseDir)
     manifest = Manifest(listOfIncludes, {})
-    listOfHashes = [getFileHash(fileName) for fileName in listOfIncludes]
+    listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in listOfIncludes]
     includesKey = getHash(','.join(listOfHashes))
     if singlePreprocess:
         index = cmdLine.index(sourceFile)
@@ -862,9 +881,12 @@ if analysisResult != AnalysisResult.Ok:
 
 manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
 manifest = cache.getManifest(manifestHash)
+baseDir = os.environ.get('CLCACHE_BASEDIR')
+if baseDir and not baseDir.endswith(os.path.sep):
+    baseDir += os.path.sep
 if manifest is not None:
     # NOTE: command line options already included in hash for manifest name
-    listOfHashes = [getFileHash(fileName) for fileName in manifest.includeFiles]
+    listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in manifest.includeFiles]
     includesKey = getHash(','.join(listOfHashes))
     cachekey = manifest.hashes.get(includesKey)
     if cachekey is not None:
@@ -876,4 +898,4 @@ if manifest is not None:
         # Some of header files changed - recompile and add to manifest
         processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine)
 else:
-    processNoManifestMiss(stats, cache, outputFile, manifestHash, compiler, cmdLine)
+    processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine)
