@@ -830,10 +830,10 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     manifest = Manifest(listOfIncludes, {})
     listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in listOfIncludes]
     includesKey = getHash(','.join(listOfHashes))
+    cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
     if singlePreprocess:
         index = cmdLine.index(sourceFile)
         cmdLine[index] = preprocessedFile
-    cachekey = getFileHash(sourceFile, includesKey)
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if singlePreprocess:
         os.remove(preprocessedFile)
