@@ -833,7 +833,7 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     if singlePreprocess:
         index = cmdLine.index(sourceFile)
         cmdLine[index] = preprocessedFile
-    cachekey = getHash(includesKey)
+    cachekey = getFileHash(sourceFile, includesKey)
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if singlePreprocess:
         os.remove(preprocessedFile)
