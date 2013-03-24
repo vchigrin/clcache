@@ -30,6 +30,7 @@
 import codecs
 from collections import defaultdict, namedtuple
 import cPickle as pickle
+import ctypes
 
 from filelock import FileLock
 import hashlib
@@ -126,7 +127,7 @@ class ObjectCache:
     def setEntry(self, key, objectFileName, compilerOutput):
         if not os.path.exists(self._cacheEntryDir(key)):
             os.makedirs(self._cacheEntryDir(key))
-        copyfile(objectFileName, self.cachedObjectName(key))
+        copyOrLink(objectFileName, self.cachedObjectName(key))
         open(self._cachedCompilerOutputName(key), 'w').write(compilerOutput)
 
     def setManifest(self, manifestHash, manifest):
@@ -393,6 +394,20 @@ def findCompilerBinary():
                 return path
     return None
 
+def copyOrLink(srcFilePath, dstFilePath):
+    if 'CLCACHE_HARDLINK' in os.environ:
+        ok = ctypes.windll.kernel32.CreateHardLinkW(unicode(dstFilePath), unicode(srcFilePath), None)
+        if ok != 0:
+            # Freshen file times to ensure build tool will not be surprised by
+            # "old" file. Note, that this also changes time of file in cache and
+            # theoretically, in other directories too.
+            os.utime(dstFilePath, None)
+            return
+        sys.stderr.write('clcache warning: Failed hardlink {src} to {dst}. Error {error}. Try to copy file\n'.format(
+            src=srcFilePath,
+            dst=dstFilePath,
+            error=ctypes.windll.kernel32.GetLastError()))
+    copyfile(srcFilePath, dstFilePath)
 
 def printTraceStatement(msg):
     if "CLCACHE_LOG" in os.environ:
@@ -731,7 +746,7 @@ def parsePreprocessorOutput(preprocessorOutput, sourceFile, baseDir):
                     # #line directives. Ignoring such files seems safe, since if
                     # some file is  really should be used for compilation, but
                     # it absent in filesystem, preprocessor should fail.
-                    sys.stderr.write('clcache warning. File {filePath} not found'
+                    sys.stderr.write('clcache warning: File {filePath} not found'
                                      ' - excluding from preprocessor dependencies'
                                      .format(filePath=filePath))
     return list(includesSet)
@@ -772,7 +787,7 @@ def processCacheHit(stats, cache, outputFile, cachekey):
     stats.save()
     printTraceStatement("Reusing cached object for key " + cachekey + " for " +
                         "output file " + outputFile)
-    copyfile(cache.cachedObjectName(cachekey), outputFile)
+    copyOrLink(cache.cachedObjectName(cachekey), outputFile)
     sys.stdout.write(cache.cachedCompilerOutput(cachekey))
     printTraceStatement("Finished. Exit code 0")
     sys.exit(0)
