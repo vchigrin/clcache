@@ -96,6 +96,19 @@ class ObjectCache:
                 break
         stats.setCacheSize(currentSize)
 
+    def removeObjects(self, stats, removedObjects):
+        if len(removedObjects) == 0:
+            return
+        # Ensure other processes will not touch cache during cleaning
+        stats.ensureLoadedAndLocked()
+        currentSize = stats.currentCacheSize()
+        for hash in removedObjects:
+            dirPath = os.path.join(self.dir, hash)
+            file_stat = os.stat(os.path.join(dirPath, "object"))
+            rmtree(dirPath)
+            currentSize -= stat.st_size
+        stats.setCacheSize(currentSize)
+
     def getManifestHash(self, compilerBinary, commandLine, sourceFile):
         stat = os.stat(compilerBinary)
         # NOTE: We intentionally do not normalize command line to include
@@ -782,8 +795,11 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and os.path.exists(outputFile):
         addObjectToCache(cache, outputFile, compilerOutput, cachekey)
+        removedItems = []
         while len(manifest.hashes) >= MAX_MANIFEST_HASHES:
-            manifest.hashes.popitem()
+            key, objectHash = manifest.hashes.popitem()
+            removedItems.append(objectHash)
+        cache.removeObjects(rstats, removedItems)
         manifest.hashes[includesKey] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
