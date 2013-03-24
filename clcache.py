@@ -694,7 +694,16 @@ def parsePreprocessorOutput(preprocessorOutput, sourceFile):
         if match is not None:
             filePath = match.group('file_path').replace('\\\\', '\\')
             if filePath != absSourceFile:
-                includesSet.add(filePath)
+                if os.path.exists(filePath):
+                    includesSet.add(filePath)
+                else:
+                    # This can happen in cases, when source file already has
+                    # #line directives. Ignoring such files seems safe, since if
+                    # some file is  really should be used for compilation, but
+                    # it absent in filesystem, preprocessor should fail.
+                    sys.stderr.write('clcache warning. File {filePath} not found'
+                                     ' - excluding from preprocessor dependencies'
+                                     .format(filePath=filePath))
     return list(includesSet)
 
 def preprocessFile(compilerBinary, commandLine, sourceFile, cache, captureOutput=False):
