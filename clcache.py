@@ -808,7 +808,7 @@ def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine):
     sys.exit(returnCode)
 
 def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine):
-    cachekey = getHash(includesKey)
+    cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
     stats.registerHeaderChangedMiss()
     returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and os.path.exists(outputFile):
