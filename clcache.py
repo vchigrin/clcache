@@ -817,7 +817,7 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
         while len(manifest.hashes) >= MAX_MANIFEST_HASHES:
             key, objectHash = manifest.hashes.popitem()
             removedItems.append(objectHash)
-        cache.removeObjects(rstats, removedItems)
+        cache.removeObjects(stats, removedItems)
         manifest.hashes[includesKey] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
