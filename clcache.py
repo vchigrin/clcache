@@ -790,6 +790,8 @@ def processCacheHit(stats, cache, outputFile, cachekey):
     stats.save()
     printTraceStatement("Reusing cached object for key " + cachekey + " for " +
                         "output file " + outputFile)
+    if os.path.exists(outputFile):
+        os.remove(outputFile)
     copyOrLink(cache.cachedObjectName(cachekey), outputFile)
     sys.stdout.write(cache.cachedCompilerOutput(cachekey))
     printTraceStatement("Finished. Exit code 0")
