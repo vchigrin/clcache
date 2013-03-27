@@ -874,6 +874,10 @@ if len(sys.argv) == 3 and sys.argv[1] == "-M":
     cfg = Configuration(cache)
     cfg.setMaximumCacheSize(int(sys.argv[2]))
     cfg.save()
+    lock = cacheLock(cache)
+    stats = CacheStatistics(cache, lock)
+    cache.clean(stats, cfg.maximumCacheSize())
+    stats.save()
     sys.exit(0)
 
 compiler = findCompilerBinary()
