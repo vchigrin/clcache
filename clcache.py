@@ -378,6 +378,8 @@ def getRelFileHash(filePath, baseDir):
             sys.stderr.write('No CLCACHE_BASEDIR set, but found relative path ' + filePath)
             sys.exit(1)
         filePath = filePath.replace(BASEDIR_REPLACEMENT, baseDir, 1)
+    if not os.path.exists(filePath):
+        return None
     return getFileHash(filePath)
 
 def getHash(data):
@@ -926,7 +928,13 @@ if baseDir and not baseDir.endswith(os.path.sep):
     baseDir += os.path.sep
 if manifest is not None:
     # NOTE: command line options already included in hash for manifest name
-    listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in manifest.includeFiles]
+    listOfHashes = []
+    for fileName in manifest.includeFiles:
+        fileHash = getRelFileHash(fileName, baseDir)
+        if fileHash is not None:
+            # May be if source does not use this header anymore (e.g. if that
+            # header was included through some other header, which now changed).
+            listOfHashes.append(fileHash)
     includesKey = getHash(','.join(listOfHashes))
     cachekey = manifest.hashes.get(includesKey)
     if cachekey is not None:
