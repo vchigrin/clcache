@@ -30,9 +30,8 @@
 import codecs
 from collections import defaultdict, namedtuple
 import cPickle as pickle
-import ctypes
+from ctypes import windll, wintypes
 
-from filelock import FileLock
 import hashlib
 import json
 import os
@@ -56,9 +55,54 @@ MAX_MANIFEST_HASHES = 100
 BASEDIR_REPLACEMENT = '?'
 
 def cacheLock(cache):
-    lock = FileLock("x", timeout=100)
-    lock.lockfile = os.path.join(cache.cacheDirectory(), "cache.lock")
-    return lock
+    name = cache.cacheDirectory().replace(':', '-').replace('\\','-')
+    result = NamedLock(name, 100 * 1000)
+    return result
+
+class LockException(Exception):
+    pass
+
+class NamedLock:
+    """Wrapper around named mutex in session namespace.
+    """
+    INFINITE = 0xFFFFFFFF
+
+    def __init__(self, mutexName, timeoutMs):
+        mutexName = 'Local\\' + mutexName
+        self._mutex = windll.kernel32.CreateMutexW(
+            wintypes.c_int(0),
+            wintypes.c_int(0),
+            unicode(mutexName))
+        self._timeoutMs = timeoutMs
+        self._acquired = False
+        assert self._mutex
+
+    def __enter__(self):
+        if not self._acquired:
+            self.acquire()
+
+    def __exit__(self, type, value, traceback):
+        if self._acquired:
+            self.release()
+
+    def __del__(self):
+        windll.kernel32.CloseHandle(self._mutex)
+
+    def acquire(self):
+        WAIT_ABANDONED = 0x00000080
+        result = windll.kernel32.WaitForSingleObject(
+            self._mutex, wintypes.c_int(self._timeoutMs))
+        if result != 0 and result != WAIT_ABANDONED:
+            errorString ='Error! WaitForSingleObject returns {result}, last error {error}'.format(
+                result=result,
+                error=windll.kernel32.GetLastError())
+            raise LockException(errorString)
+        self._acquired = True
+
+    def release(self):
+        windll.kernel32.ReleaseMutex(self._mutex)
+        self._acquired = False
+
 
 class ObjectCache:
     def __init__(self):
@@ -69,7 +113,11 @@ class ObjectCache:
         self.tempDir = os.path.join(self.dir, '.temp')
         # Creates both self.dir and self.tempDir if neccessary
         if not os.path.exists(self.tempDir):
-            os.makedirs(self.tempDir)
+        # Guarded by lock to avoid exceptions when multiple processes started
+        # and try to create the same dir.
+            with cacheLock(self):
+                if not os.path.exists(self.tempDir):
+                    os.makedirs(self.tempDir)
 
     def cacheDirectory(self):
         return self.dir
@@ -401,7 +449,7 @@ def findCompilerBinary():
 
 def copyOrLink(srcFilePath, dstFilePath):
     if 'CLCACHE_HARDLINK' in os.environ:
-        ok = ctypes.windll.kernel32.CreateHardLinkW(unicode(dstFilePath), unicode(srcFilePath), None)
+        ok = windll.kernel32.CreateHardLinkW(unicode(dstFilePath), unicode(srcFilePath), None)
         if ok != 0:
             # Freshen file times to ensure build tool will not be surprised by
             # "old" file. Note, that this also changes time of file in cache and
@@ -411,7 +459,7 @@ def copyOrLink(srcFilePath, dstFilePath):
         sys.stderr.write('clcache warning: Failed hardlink {src} to {dst}. Error {error}. Try to copy file\n'.format(
             src=srcFilePath,
             dst=dstFilePath,
-            error=ctypes.windll.kernel32.GetLastError()))
+            error=windll.kernel32.GetLastError()))
     copyfile(srcFilePath, dstFilePath)
 
 def printTraceStatement(msg):
