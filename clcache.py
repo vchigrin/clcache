@@ -901,97 +901,102 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     printTraceStatement("Finished. Exit code %d" % returnCode)
     sys.exit(returnCode)
 
-if len(sys.argv) == 2 and sys.argv[1] == "--help":
-    print """\
-clcache.py v0.1"
-  --help   : show this help
-  -s       : print cache statistics
-  -z       : reset cache statistics
-  -M <size>: set maximum cache size (in bytes)
-"""
-    sys.exit(0)
 
-if len(sys.argv) == 2 and sys.argv[1] == "-s":
-    printStatistics()
-    sys.exit(0)
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--help":
+        print """\
+    clcache.py v0.1"
+      --help   : show this help
+      -s       : print cache statistics
+      -z       : reset cache statistics
+      -M <size>: set maximum cache size (in bytes)
+    """
+        return 0
 
-if len(sys.argv) == 2 and sys.argv[1] == "-z":
-    resetStatistics()
-    sys.exit(0)
+    if len(sys.argv) == 2 and sys.argv[1] == "-s":
+        printStatistics()
+        return 0
 
-if len(sys.argv) == 3 and sys.argv[1] == "-M":
+    if len(sys.argv) == 2 and sys.argv[1] == "-z":
+        resetStatistics()
+        return 0
+
+    if len(sys.argv) == 3 and sys.argv[1] == "-M":
+        cache = ObjectCache()
+        cfg = Configuration(cache)
+        cfg.setMaximumCacheSize(int(sys.argv[2]))
+        cfg.save()
+        lock = cacheLock(cache)
+        stats = CacheStatistics(cache, lock)
+        cache.clean(stats, cfg.maximumCacheSize())
+        stats.save()
+        return 0
+
+    compiler = findCompilerBinary()
+    if not compiler:
+        print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
+        return 1
+
+    printTraceStatement("Found real compiler binary at '%s'" % compiler)
+
+    if "CLCACHE_DISABLE" in os.environ:
+        return invokeRealCompiler(compiler, sys.argv[1:])[0]
+
+    printTraceStatement("Parsing given commandline '%s'" % sys.argv[1:] )
+
+    cmdLine = expandCommandLine(sys.argv[1:])
+    printTraceStatement("Expanded commandline '%s'" % cmdLine )
+    analysisResult, sourceFile, outputFile = analyzeCommandLine(cmdLine)
+
+    if analysisResult == AnalysisResult.MultipleSourceFilesSimple:
+        return reinvokePerSourceFile(cmdLine, sourceFile)
+
     cache = ObjectCache()
-    cfg = Configuration(cache)
-    cfg.setMaximumCacheSize(int(sys.argv[2]))
-    cfg.save()
     lock = cacheLock(cache)
     stats = CacheStatistics(cache, lock)
-    cache.clean(stats, cfg.maximumCacheSize())
-    stats.save()
-    sys.exit(0)
 
-compiler = findCompilerBinary()
-if not compiler:
-    print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
-    sys.exit(1)
+    if analysisResult != AnalysisResult.Ok:
+        if analysisResult == AnalysisResult.NoSourceFile:
+            printTraceStatement("Cannot cache invocation as %s: no source file found" % (' '.join(cmdLine)) )
+            stats.registerCallWithoutSourceFile()
+        elif analysisResult == AnalysisResult.MultipleSourceFilesComplex:
+            printTraceStatement("Cannot cache invocation as %s: multiple source files found" % (' '.join(cmdLine)) )
+            stats.registerCallWithMultipleSourceFiles()
+        elif analysisResult == AnalysisResult.CalledWithPch:
+            printTraceStatement("Cannot cache invocation as %s: precompiled headers in use" % (' '.join(cmdLine)) )
+            stats.registerCallWithPch()
+        elif analysisResult == AnalysisResult.CalledForLink:
+            printTraceStatement("Cannot cache invocation as %s: called for linking" % (' '.join(cmdLine)) )
+            stats.registerCallForLinking()
+        stats.save()
+        return invokeRealCompiler(compiler, sys.argv[1:])[0]
 
-printTraceStatement("Found real compiler binary at '%s'" % compiler)
-
-if "CLCACHE_DISABLE" in os.environ:
-    sys.exit(invokeRealCompiler(compiler, sys.argv[1:])[0])
-
-printTraceStatement("Parsing given commandline '%s'" % sys.argv[1:] )
-
-cmdLine = expandCommandLine(sys.argv[1:])
-printTraceStatement("Expanded commandline '%s'" % cmdLine )
-analysisResult, sourceFile, outputFile = analyzeCommandLine(cmdLine)
-
-if analysisResult == AnalysisResult.MultipleSourceFilesSimple:
-    sys.exit(reinvokePerSourceFile(cmdLine, sourceFile))
-
-cache = ObjectCache()
-lock = cacheLock(cache)
-stats = CacheStatistics(cache, lock)
-
-if analysisResult != AnalysisResult.Ok:
-    if analysisResult == AnalysisResult.NoSourceFile:
-        printTraceStatement("Cannot cache invocation as %s: no source file found" % (' '.join(cmdLine)) )
-        stats.registerCallWithoutSourceFile()
-    elif analysisResult == AnalysisResult.MultipleSourceFilesComplex:
-        printTraceStatement("Cannot cache invocation as %s: multiple source files found" % (' '.join(cmdLine)) )
-        stats.registerCallWithMultipleSourceFiles()
-    elif analysisResult == AnalysisResult.CalledWithPch:
-        printTraceStatement("Cannot cache invocation as %s: precompiled headers in use" % (' '.join(cmdLine)) )
-        stats.registerCallWithPch()
-    elif analysisResult == AnalysisResult.CalledForLink:
-        printTraceStatement("Cannot cache invocation as %s: called for linking" % (' '.join(cmdLine)) )
-        stats.registerCallForLinking()
-    stats.save()
-    sys.exit(invokeRealCompiler(compiler, sys.argv[1:])[0])
-
-manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
-manifest = cache.getManifest(manifestHash)
-baseDir = os.environ.get('CLCACHE_BASEDIR')
-if baseDir and not baseDir.endswith(os.path.sep):
-    baseDir += os.path.sep
-if manifest is not None:
-    # NOTE: command line options already included in hash for manifest name
-    listOfHashes = []
-    for fileName in manifest.includeFiles:
-        fileHash = getRelFileHash(fileName, baseDir)
-        if fileHash is not None:
-            # May be if source does not use this header anymore (e.g. if that
-            # header was included through some other header, which now changed).
-            listOfHashes.append(fileHash)
-    includesKey = getHash(','.join(listOfHashes))
-    cachekey = manifest.hashes.get(includesKey)
-    if cachekey is not None:
-        if cache.hasEntry(cachekey):
-            processCacheHit(stats, cache, outputFile, cachekey)
+    manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
+    manifest = cache.getManifest(manifestHash)
+    baseDir = os.environ.get('CLCACHE_BASEDIR')
+    if baseDir and not baseDir.endswith(os.path.sep):
+        baseDir += os.path.sep
+    if manifest is not None:
+        # NOTE: command line options already included in hash for manifest name
+        listOfHashes = []
+        for fileName in manifest.includeFiles:
+            fileHash = getRelFileHash(fileName, baseDir)
+            if fileHash is not None:
+                # May be if source does not use this header anymore (e.g. if that
+                # header was included through some other header, which now changed).
+                listOfHashes.append(fileHash)
+        includesKey = getHash(','.join(listOfHashes))
+        cachekey = manifest.hashes.get(includesKey)
+        if cachekey is not None:
+            if cache.hasEntry(cachekey):
+                processCacheHit(stats, cache, outputFile, cachekey)
+            else:
+                processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine)
         else:
-            processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine)
+            # Some of header files changed - recompile and add to manifest
+            processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine)
     else:
-        # Some of header files changed - recompile and add to manifest
-        processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine)
-else:
-    processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine)
+        processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine)
+
+if __name__ == '__main__':
+    sys.exit(main())
