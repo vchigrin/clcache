@@ -111,13 +111,17 @@ class ObjectCache:
         except KeyError:
             self.dir = os.path.join(os.path.expanduser("~"), "clcache")
         self.tempDir = os.path.join(self.dir, '.temp')
+        self.daemonsDir = os.path.join(self.dir, '.daemons')
+
         # Creates both self.dir and self.tempDir if neccessary
-        if not os.path.exists(self.tempDir):
+        if not (os.path.exists(self.tempDir) and os.path.exists(self.daemonsDir)):
         # Guarded by lock to avoid exceptions when multiple processes started
         # and try to create the same dir.
             with cacheLock(self):
                 if not os.path.exists(self.tempDir):
                     os.makedirs(self.tempDir)
+                if not os.path.exists(self.daemonsDir):
+                    os.makedirs(self.daemonsDir)
 
     def cacheDirectory(self):
         return self.dir
@@ -205,6 +209,22 @@ class ObjectCache:
         handle, path = tempfile.mkstemp(suffix=ext, dir=self.tempDir)
         os.close(handle)
         return path
+
+    def getDaemonDir(self, daemonPid):
+        return os.path.join(self.daemonsDir, str(daemonPid))
+
+    def regiterDaemon(self, daemonPid):
+        with cacheLock(self):
+            os.makedirs(self.getDaemonDir(daemonPid))
+
+    def unregiterDaemon(self, daemonPid):
+        with cacheLock(self):
+            rmtree(self.getDaemonDir(daemonPid))
+
+    def getAllDaemonPids(self):
+        with cacheLock(self):
+            dirs = os.listdir(self.daemonsDir)
+        return [int(d) for d in dirs]
 
     def _cacheEntryDir(self, key):
         return os.path.join(self.dir, key[:2], key)
@@ -901,6 +921,49 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     printTraceStatement("Finished. Exit code %d" % returnCode)
     sys.exit(returnCode)
 
+def cacodaemonMain(daemonNumber):
+    cache = ObjectCache()
+    myDir = cache.getDaemonDir(os.getpid())
+    sys.stdout = open(os.path.join(myDir, 'stdout.txt'), 'w')
+    sys.stderr = open(os.path.join(myDir, 'stderr.txt'), 'w')
+    # TODO: implementation of pipe listening loop
+
+
+
+def spawnCacodaemons(count):
+    # Kill already existing daemons, if any
+    killCacodaemons()
+    cache = ObjectCache()
+    for i in range(count):
+        args = [sys.executable, sys.argv[0], '--cacodaemon', str(i)]
+        process = subprocess.Popen(args)
+        cache.regiterDaemon(process.pid)
+        print 'Spawned {pid}'.format(pid=process.pid)
+    return 0
+
+def killCacodaemons():
+    cache = ObjectCache()
+    pids = cache.getAllDaemonPids()
+    PROCESS_TERMINATE = 0x01
+    SYNCHRONIZE = 0x00100000
+    INFINITE = 0xFFFFFFFF
+    for pid in pids:
+        print('Terminating {pid}..'.format(pid=pid))
+        hProcess = windll.kernel32.OpenProcess(wintypes.c_int(PROCESS_TERMINATE | SYNCHRONIZE),
+                                               wintypes.c_int(0),
+                                               wintypes.c_int(pid))
+        if not hProcess:
+            print('Failed open process, error {error}'.
+                format(error=windll.kernel32.GetLastError()))
+            cache.unregiterDaemon(pid)
+            continue
+        if not windll.kernel32.TerminateProcess(hProcess, 1):
+            print('Failed terminate process, error {error}'.
+                format(error=windll.kernel32.GetLastError()))
+
+        result = windll.kernel32.WaitForSingleObject(
+            hProcess, wintypes.c_int(INFINITE))
+        cache.unregiterDaemon(pid)
 
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--help":
@@ -910,6 +973,9 @@ def main():
       -s       : print cache statistics
       -z       : reset cache statistics
       -M <size>: set maximum cache size (in bytes)
+      --spawn-cacodaemons <count> : spawns count cacodemon processes.
+      --cacodaemon <number>  : used internally by spawn-cacodaemons.
+      --kill-cacodaemons     : kill all cacodaemons associated with current cache dir.
     """
         return 0
 
@@ -930,6 +996,17 @@ def main():
         stats = CacheStatistics(cache, lock)
         cache.clean(stats, cfg.maximumCacheSize())
         stats.save()
+        return 0
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--spawn-cacodaemons":
+        return spawnCacodaemons(int(sys.argv[2]))
+
+    if len(sys.argv) == 3 and sys.argv[1] == "--cacodaemon":
+        cacodaemonMain(int(sys.argv[2]))
+        return 0
+
+    if len(sys.argv) == 2 and sys.argv[1] == "--kill-cacodaemons":
+        killCacodaemons()
         return 0
 
     compiler = findCompilerBinary()
