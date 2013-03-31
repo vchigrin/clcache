@@ -63,6 +63,22 @@ def cacheLock(cache):
     result = NamedLock(name, 100 * 1000)
     return result
 
+# It is expected that during building we have only few possible
+# PATH variants, so caching should work great here in dameon mode.
+COMPILER_PATH_CACHE = {}
+
+# Many source files will include the same includes (e.g system includes).
+# We will cache their hashes based on path and file modification time, to
+# speed up build process.
+HEADER_HASH_CACHE = {}
+
+# Path - either absolute or relative to BASE_DIR (if possible) path,
+# mtime - modification time of file. We need use it since some headers may be
+# re-generated during build process.
+def get_header_key(path, mtime):
+    return '{mtime}:{path}'.format(mtime=mtime, path=path)
+
+
 class LockException(Exception):
     pass
 
@@ -445,14 +461,21 @@ def getFileHash(filePath, additionalData = None):
     return sha.hexdigest()
 
 def getRelFileHash(filePath, baseDir):
-    if filePath.startswith(BASEDIR_REPLACEMENT):
+    absFilePath = filePath
+    if absFilePath.startswith(BASEDIR_REPLACEMENT):
         if not baseDir:
             sys.stderr.write('No CLCACHE_BASEDIR set, but found relative path ' + filePath)
             sys.exit(1)
-        filePath = filePath.replace(BASEDIR_REPLACEMENT, baseDir, 1)
-    if not os.path.exists(filePath):
+        absFilePath = absFilePath.replace(BASEDIR_REPLACEMENT, baseDir, 1)
+    if not os.path.exists(absFilePath):
         return None
-    return getFileHash(filePath)
+    key = get_header_key(filePath, os.path.getmtime(absFilePath))
+    result = HEADER_HASH_CACHE.get(key)
+    if result is not None:
+        return result
+    result = getFileHash(absFilePath)
+    HEADER_HASH_CACHE[key] = result
+    return result
 
 def getHash(data):
     sha = hashlib.sha1()
@@ -460,14 +483,19 @@ def getHash(data):
     return sha.hexdigest()
 
 def findCompilerBinary(pathVariable):
+    compiler = COMPILER_PATH_CACHE.get(pathVariable)
+    if compiler:
+        return compiler
     try:
         path = os.environ["CLCACHE_CL"]
         if os.path.exists(path):
+            COMPILER_PATH_CACHE[pathVariable] = path
             return path
     except KeyError:
         for dir in pathVariable.split(os.pathsep):
             path = os.path.join(dir, "cl.exe")
             if os.path.exists(path):
+                COMPILER_PATH_CACHE[pathVariable] = path
                 return path
     return None
 
@@ -931,7 +959,7 @@ def serveClient(hPipe):
 
     ERROR_MORE_DATA = 234
     messages = []
-    for i in range(3):
+    for i in range(4):
         inputMessage = ''
         while True:
             bytes_read = ctypes.c_int(0)
@@ -950,8 +978,13 @@ def serveClient(hPipe):
                 break
         # Decode to python string
         messages.append(unicode(inputMessage,'UTF-16'))
-    pathVariable, currentDirectory, commandLine = messages
+    pathVariable, includeVariable, currentDirectory, commandLine = messages
     os.chdir(currentDirectory)
+    # Change env. since in other case child cl.exe may not launch since it will
+    # fail to locate DLLs.
+    # TODO: it is better to use it as argument of Popen instead.
+    os.environ['PATH'] = pathVariable
+    os.environ['INCLUDE'] = includeVariable
     compiler = findCompilerBinary(pathVariable)
     if not compiler:
         print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
@@ -986,7 +1019,6 @@ def cacodaemonMain(daemonNumber):
     PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
     PIPE_UNLIMITED_INSTANCES = 255
     INVALID_HANDLE_VALUE = 0xFFFFFFFF
-    print 'Creating pipe ' + pipeName
     hPipe = ctypes.windll.kernel32.CreateNamedPipeW(ctypes.c_wchar_p(pipeName),
         ctypes.c_int(PIPE_ACCESS_DUPLEX),
         ctypes.c_int(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS),
@@ -1004,7 +1036,6 @@ def cacodaemonMain(daemonNumber):
             print('Failed connect pipe {name}. Error {error}.'.
                     format(name=pipeName, error=ctypes.windll.kernel32.GetLastError()))
             return 1
-        print 'Got connection from client!'
         serveClient(hPipe)
         if not ctypes.windll.kernel32.DisconnectNamedPipe(hPipe):
             print('Failed disconnect pipe {name}. Error {error}.'.

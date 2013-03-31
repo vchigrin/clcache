@@ -13,10 +13,10 @@ typedef struct tagRESULT_BLOCK_HEADER{
 /* Returns length of the string, excluding terminating null,
    or -1 if error occurs
  */
-int generate_pipe_name(wchar_t* dst, wchar_t* clcache_dir) {
+int generate_pipe_name(wchar_t* dst, const wchar_t* clcache_dir) {
   #define PIPE_PREFIX L"\\\\.\\pipe\\"
   wchar_t* p_d = dst + wcslen(PIPE_PREFIX);
-  wchar_t* p_s = clcache_dir;
+  const wchar_t* p_s = clcache_dir;
   wcscpy(dst, PIPE_PREFIX);
   for (; *p_s; ++p_s) {
     if ((p_d - dst) >= BUFFER_SIZE)
@@ -75,7 +75,19 @@ int send_wstring(HANDLE h_pipe, const wchar_t* str) {
   return 1;
 }
 
-int try_do_work(const wchar_t* pipe_name, const wchar_t* path_variable, DWORD* exit_code) {
+// Warning: returns pointer to static buffer. It will be overwritten on next
+// function call
+const wchar_t* get_env_variable(const wchar_t* name) {
+  static wchar_t env_buffer[BUFFER_SIZE];
+  DWORD result = GetEnvironmentVariable(name,
+                                  env_buffer,
+                                  BUFFER_SIZE);
+  if (result == 0 || result > BUFFER_SIZE)
+    env_buffer[0] = 0;
+  return env_buffer;
+}
+
+int try_do_work(const wchar_t* pipe_name, DWORD* exit_code) {
   DWORD bytes_transferred = 0;
   RESULT_BLOCK_HEADER header;
   static wchar_t current_directory[MAX_PATH + 1];
@@ -99,7 +111,9 @@ int try_do_work(const wchar_t* pipe_name, const wchar_t* path_variable, DWORD* e
     fprintf(stderr,"Failed get current directory. %d\n", GetLastError());
     return 0;
   }
-  if (!send_wstring(h_pipe, path_variable))
+  if (!send_wstring(h_pipe, get_env_variable(L"PATH")))
+    return 0;
+  if (!send_wstring(h_pipe, get_env_variable(L"INCLUDE")))
     return 0;
   if (!send_wstring(h_pipe, current_directory))
     return 0;
@@ -120,33 +134,22 @@ int try_do_work(const wchar_t* pipe_name, const wchar_t* path_variable, DWORD* e
 }
 
 int main(int argc, char* argv[]) {
-  static wchar_t env_buffer[BUFFER_SIZE];
   static wchar_t pipe_name[BUFFER_SIZE];
   int i = 0;
   int exit_code = 0;
-  result = GetEnvironmentVariable(L"CLCACHE_DIR",
-                                  env_buffer,
-                                  BUFFER_SIZE);
-  if (result == 0 || result > BUFFER_SIZE) {
+  const wchar_t* clcache_dir = NULL;
+
+  clcache_dir = get_env_variable(L"CLCACHE_DIR");
+  if (clcache_dir[0] == 0) {
     fprintf(stderr, "Failed get CLCACHE_DIR environment variable.\n");
     return 1;
   }
-  base_len = generate_pipe_name(pipe_name, env_buffer);
-  if (base_len <= 0) {
-    printf("CLCACHE_DIR Too large.\n");
-  if (!generate_pipe_name(pipe_name, env_buffer)) {
+  if (!generate_pipe_name(pipe_name, clcache_dir)) {
     fprintf(stderr,"CLCACHE_DIR Too large.\n");
     return 1;
   }
-  result = GetEnvironmentVariable(L"PATH",
-                                  env_buffer,
-                                  BUFFER_SIZE);
-  if (result == 0 || result > BUFFER_SIZE) {
-    printf("Failed get PATH environment variable.\n");
-    return 1;
-  }
   while(1) {
-    if (try_do_work(pipe_name, env_buffer, &exit_code)) {
+    if (try_do_work(pipe_name, &exit_code)) {
       return exit_code;
     }
     if (!WaitNamedPipe(pipe_name, NMPWAIT_WAIT_FOREVER)) {
