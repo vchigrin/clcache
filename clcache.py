@@ -1042,10 +1042,22 @@ def cacodaemonMain(daemonNumber):
                     format(name=pipeName, error=ctypes.windll.kernel32.GetLastError()))
             return 1
 
-def spawnCacodaemons(count):
+def getDefaultDaemonCount():
+    # The same algorithm, which used in ninja int GuessParallelism().
+    cpuCount = multiprocessing.cpu_count()
+    if cpuCount < 2:
+        return cpuCount
+    elif cpuCount == 2:
+        return 3
+    else:
+        return cpuCount + 2
+
+def spawnCacodaemons(count = 0):
     if "CLCACHE_DISABLE" in os.environ:
         print 'CLCACHE_DISABLE present in environment - do not spawn daemons'
         return 1
+    if count == 0:
+        count = getDefaultDaemonCount()
     # Kill already existing daemons, if any
     killCacodaemons()
     cache = ObjectCache()
@@ -1090,7 +1102,7 @@ def main():
       -z       : reset cache statistics
       -M <size>: set maximum cache size (in bytes)
       --spawn-cacodaemons <count> : spawns count cacodemon processes.
-      --cacodaemon <number>  : used internally by spawn-cacodaemons.
+      --cacodaemon [<number>]  : used internally by spawn-cacodaemons.
       --kill-cacodaemons     : kill all cacodaemons associated with current cache dir.
     """
         return 0
@@ -1114,8 +1126,11 @@ def main():
         stats.save()
         return 0
 
-    if len(sys.argv) == 3 and sys.argv[1] == "--spawn-cacodaemons":
-        return spawnCacodaemons(int(sys.argv[2]))
+    if len(sys.argv) >= 2 and sys.argv[1] == "--spawn-cacodaemons":
+        daemonsCount = 0
+        if len(sys.argv) >= 3:
+            daemonsCount = int(sys.argv[2])
+        return spawnCacodaemons(daemonsCount)
 
     if len(sys.argv) == 3 and sys.argv[1] == "--cacodaemon":
         cacodaemonMain(int(sys.argv[2]))
