@@ -194,13 +194,16 @@ class ObjectCache:
         return getFileHash(sourceFile, additionalData)
 
     def hasEntry(self, key):
-        return os.path.exists(self.cachedObjectName(key))
+        return os.path.exists(self.cachedObjectName(key)) or os.path.exists(self._cachedCompilerOutputName(key))
 
-    def setEntry(self, key, objectFileName, compilerOutput):
+    def setEntry(self, key, objectFileName, compilerOutput, compilerStderr):
         if not os.path.exists(self._cacheEntryDir(key)):
             os.makedirs(self._cacheEntryDir(key))
-        copyOrLink(objectFileName, self.cachedObjectName(key))
+        if objectFileName != '':
+            copyOrLink(objectFileName, self.cachedObjectName(key))
         open(self._cachedCompilerOutputName(key), 'w').write(compilerOutput)
+        if compilerStderr != '':
+            open(self._cachedCompilerStderrName(key), 'w').write(compilerStderr)
 
     def setManifest(self, manifestHash, manifest):
         if not os.path.exists(self._cacheEntryDir(manifestHash)):
@@ -223,6 +226,12 @@ class ObjectCache:
 
     def cachedCompilerOutput(self, key):
         return open(self._cachedCompilerOutputName(key), 'r').read()
+
+    def cachedCompilerStderr(self, key):
+        fileName = self._cachedCompilerStderrName(key)
+        if os.path.exists(fileName):
+            return open(fileName, 'r').read()
+        return ''
 
     def getTempFilePath(self, sourceFile):
         ext =  os.path.splitext(sourceFile)[1]
@@ -251,6 +260,9 @@ class ObjectCache:
 
     def _cachedCompilerOutputName(self, key):
         return os.path.join(self._cacheEntryDir(key), "output.txt")
+
+    def _cachedCompilerStderrName(self, key):
+        return os.path.join(self._cacheEntryDir(key), "stderr.txt")
 
     def _manifestName(self, key):
         return os.path.join(self._cacheEntryDir(key), "manifest.dat")
@@ -590,7 +602,7 @@ def parseCommandLine(cmdline):
                             'D', 'U', 'I', 'Zp', 'vm',
                             'MP', 'Tc', 'V', 'wd', 'wo',
                             'W', 'Yc', 'Yl', 'Tp', 'we',
-                            'Yu', 'Zm', 'F']
+                            'Yu', 'Zm', 'F', 'Fi']
     options = defaultdict(list)
     responseFile = ""
     sourceFiles = []
@@ -641,7 +653,14 @@ def analyzeCommandLine(cmdline):
         sourceFiles += options['Tc']
         compl = True
 
-    if 'link' in options or not 'c' in options:
+    preprocessing = False
+
+    for opt in ['E', 'EP', 'P']:
+        if opt in options:
+            preprocessing = True
+            break
+
+    if 'link' in options or (not 'c' in options and not preprocessing):
         return AnalysisResult.CalledForLink, None, None
 
     if len(sourceFiles) == 0:
@@ -655,6 +674,19 @@ def analyzeCommandLine(cmdline):
     outputFile = None
     if 'Fo' in options:
         outputFile = options['Fo'][0]
+    elif preprocessing:
+        if 'P' in options:
+            # Prerpocess to file.
+            if 'Fi' in options:
+                outputFile = options['Fi'][0]
+            else:
+                srcFileName = os.path.basename(sourceFiles[0])
+                outputFile = os.path.join(os.getcwd(),
+                                          os.path.splitext(srcFileName)[0] + ".i")
+        else:
+            # Prerocess to stdout. Use empty string rather then None to ease
+            # output to log.
+            outputFile = ''
     else:
         srcFileName = os.path.basename(sourceFiles[0])
         outputFile = os.path.join(os.getcwd(),
@@ -663,7 +695,7 @@ def analyzeCommandLine(cmdline):
     if os.path.isdir(outputFile):
         srcFileName = os.path.basename(sourceFiles[0])
         outputFile = os.path.join(outputFile,
-				  os.path.splitext(srcFileName)[0] + ".obj")
+                                 os.path.splitext(srcFileName)[0] + ".obj")
     # Strip quotes around file names; seems to happen with source files
     # with spaces in their names specified via a response file generated
     # by Visual Studio.
@@ -681,14 +713,16 @@ def invokeRealCompiler(compilerBinary, cmdLine, captureOutput=False):
     returnCode = None
     output = None
     if captureOutput:
-        compilerProcess = Popen(realCmdline, stdout=PIPE, stderr=STDOUT)
-        output = compilerProcess.communicate()[0].replace('\r\n','\n')
+        compilerProcess = Popen(realCmdline, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = compilerProcess.communicate()
+        stdout = stdout.replace('\r\n','\n')
+        stderr = stderr.replace('\r\n','\n')
         returnCode = compilerProcess.returncode
     else:
         returnCode = subprocess.call(realCmdline)
 
     printTraceStatement("Real compiler returned code %d" % returnCode)
-    return returnCode, output
+    return returnCode, stdout, stderr
 
 # Given a list of Popen objects, removes and returns
 # a completed Popen object.
@@ -831,92 +865,72 @@ def resetStatistics():
   stats.save()
   print 'Statistics reset'
 
-def parsePreprocessorOutput(preprocessorOutput, sourceFile, baseDir):
+# Returns pair - list of includes and new compiler output.
+# Output changes if strip is True in that case all lines with include
+# directives are stripped from it
+def getIncludes(compilerOutput, sourceFile, baseDir, strip):
+    newOutput = ''
     includesSet = set([])
-    reFilePath = re.compile('^#line \\d+ \\"?(?P<file_path>[^\\"]+)\\"?$')
+    reFilePath = re.compile('^Note: including file: *(?P<file_path>.+)$')
     absSourceFile = os.path.normcase(os.path.abspath(sourceFile))
     if baseDir:
         baseDir = os.path.normcase(baseDir)
-    for line in preprocessorOutput:
+    for line in compilerOutput.split('\n'):
         match = reFilePath.match(line.rstrip('\r\n'))
         if match is not None:
-            filePath = match.group('file_path').replace('\\\\', '\\')
+            filePath = match.group('file_path')
             filePath = os.path.normcase(filePath)
             if filePath != absSourceFile:
-                if os.path.exists(filePath):
-                    if baseDir and filePath.startswith(baseDir):
-                        filePath = filePath.replace(baseDir, BASEDIR_REPLACEMENT, 1)
-                    includesSet.add(filePath)
-                else:
-                    # This can happen in cases, when source file already has
-                    # #line directives. Ignoring such files seems safe, since if
-                    # some file is  really should be used for compilation, but
-                    # it absent in filesystem, preprocessor should fail.
-                    sys.stderr.write('clcache warning: File {filePath} not found'
-                                     ' - excluding from preprocessor dependencies'
-                                     .format(filePath=filePath))
-    return list(includesSet)
-
-def preprocessFile(compilerBinary, commandLine, sourceFile,
-                   cache, captureOutput=False, baseDir=None):
-    preprocessedFilePath = None
-    if captureOutput:
-        preprocessedFilePath = cache.getTempFilePath(sourceFile)
-        ppcmd = [compilerBinary, "/P", "/Fi" + preprocessedFilePath]
+                if baseDir and filePath.startswith(baseDir):
+                    filePath = filePath.replace(baseDir, BASEDIR_REPLACEMENT, 1)
+                includesSet.add(filePath)
+        elif strip:
+            newOutput += line
+    if strip:
+        return list(includesSet), newOutput
     else:
-        ppcmd = [compilerBinary, "/E"]
-    ppcmd += [arg for arg in commandLine[1:] if not arg in ("-c", "/c")]
-    preprocessor = Popen(ppcmd, stdout=PIPE, stderr=PIPE)
-    (ppout, pperr) = preprocessor.communicate()
+        return list(includesSet), compilerOutput
 
-    if preprocessor.returncode != 0:
-        sys.stderr.write(pperr)
-        sys.stderr.write("clcache: preprocessor failed\n")
-        sys.exit(preprocessor.returncode)
-    if captureOutput:
-        with open(preprocessedFilePath, 'r') as inFile:
-            listOfIncludes = parsePreprocessorOutput(inFile, sourceFile, baseDir)
-    else:
-        listOfIncludes = parsePreprocessorOutput(ppout.split('\n'), sourceFile, baseDir)
-    return listOfIncludes, preprocessedFilePath
-
-def addObjectToCache(stats, cache, outputFile, compilerOutput, cachekey):
+def addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey):
     printTraceStatement("Adding file " + outputFile + " to cache using " +
                         "key " + cachekey)
-    cache.setEntry(cachekey, outputFile, compilerOutput)
-    stats.registerCacheEntry(os.path.getsize(outputFile))
-    cfg = Configuration(cache)
-    cache.clean(stats, cfg.maximumCacheSize())
+    cache.setEntry(cachekey, outputFile, compilerOutput, compilerStderr)
+    if outputFile != '':
+        stats.registerCacheEntry(os.path.getsize(outputFile))
+        cfg = Configuration(cache)
+        cache.clean(stats, cfg.maximumCacheSize())
 
 def processCacheHit(stats, cache, outputFile, cachekey):
     stats.registerCacheHit()
     stats.save()
     printTraceStatement("Reusing cached object for key " + cachekey + " for " +
                         "output file " + outputFile)
-    if os.path.exists(outputFile):
-        os.remove(outputFile)
-    copyOrLink(cache.cachedObjectName(cachekey), outputFile)
+    if outputFile != '':
+        if os.path.exists(outputFile):
+            os.remove(outputFile)
+        copyOrLink(cache.cachedObjectName(cachekey), outputFile)
     compilerOutput = cache.cachedCompilerOutput(cachekey)
+    compilerStderr = cache.cachedCompilerStderr(cachekey)
     printTraceStatement("Finished. Exit code 0")
-    return 0, compilerOutput
+    return 0, compilerOutput, compilerStderr
 
 def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine):
     stats.registerEvictedMiss()
     printTraceStatement("Cached object already evicted for key " + cachekey + " for " +
                         "output file " + outputFile)
-    returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
-    if returnCode == 0 and os.path.exists(outputFile):
-       addObjectToCache(stats, cache, outputFile, compilerOutput, cachekey)
+    returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
+    if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
+       addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
-    return returnCode, compilerOutput
+    return returnCode, compilerOutput, compilerStderr
 
 def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine, sourceFile):
     cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
     stats.registerHeaderChangedMiss()
-    returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
-    if returnCode == 0 and os.path.exists(outputFile):
-        addObjectToCache(stats, cache, outputFile, compilerOutput, cachekey)
+    returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
+    if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
+        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
         removedItems = []
         while len(manifest.hashes) >= MAX_MANIFEST_HASHES:
             key, objectHash = manifest.hashes.popitem()
@@ -926,30 +940,34 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
         cache.setManifest(manifestHash, manifest)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
-    return returnCode, compilerOutput
+    return returnCode, compilerOutput, compilerStderr
 
 def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine, sourceFile):
     stats.registerSourceChangedMiss()
-    singlePreprocess = not 'CLCACHE_CPP2' in os.environ
-    listOfIncludes, preprocessedFile = preprocessFile(compiler, cmdLine, sourceFile,
-                                                      cache, singlePreprocess, baseDir)
+    stripIncludes = not '/showIncludes' in cmdLine
+    returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
+    grabStderr = False
+    # If these options present, cl.exe will list includes on stderr, not stdout
+    for option in ['/E', '/EP', '/P']:
+        if option in cmdLine:
+            grabStderr = True
+            break
+    if grabStderr:
+        listOfIncludes, compilerStderr = getIncludes(compilerError, sourceFile, baseDir, stripIncludes)
+    else:
+        listOfIncludes, compilerOutput = getIncludes(compilerOutput, sourceFile, baseDir, stripIncludes)
     manifest = Manifest(listOfIncludes, {})
     listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in listOfIncludes]
     includesKey = getHash(','.join(listOfHashes))
     cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
-    if singlePreprocess:
-        index = cmdLine.index(sourceFile)
-        cmdLine[index] = preprocessedFile
-    returnCode, compilerOutput = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
-    if singlePreprocess:
-        os.remove(preprocessedFile)
-    if returnCode == 0 and os.path.exists(outputFile):
-        addObjectToCache(stats, cache, outputFile, compilerOutput, cachekey)
+
+    if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
+        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
         manifest.hashes[includesKey] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
-    return returnCode, compilerOutput
+    return returnCode, compilerOutput, compilerStderr
 
 def get_pipe_name(cacheDir):
     return '\\\\.\\pipe\\' + cacheDir.replace(':', '-').replace('\\','-')
@@ -991,9 +1009,10 @@ def serveClient(hPipe):
         exitCode = 1
         stdoutData = ''
     else:
-        exitCode, stdoutData = processCompileRequest(compiler, splitCommandsFile(commandLine))
-    response = struct.pack('@II', exitCode, len(stdoutData))
+        exitCode, stdoutData, stderrData = processCompileRequest(compiler, splitCommandsFile(commandLine))
+    response = struct.pack('@III', exitCode, len(stdoutData), len(stderrData))
     response += stdoutData
+    response += stderrData
     responseBuffer = ctypes.create_string_buffer(response, len(response))
     result = ctypes.windll.kernel32.WriteFile(hPipe,
             responseBuffer,
@@ -1146,8 +1165,9 @@ def main():
     printTraceStatement("Found real compiler binary at '%s'" % compiler)
     if "CLCACHE_DISABLE" in os.environ:
         return invokeRealCompiler(compiler, args[1:])[0]
-    exitCode, compilerOutput = processCompileRequest(compiler, sys.argv)
+    exitCode, compilerOutput, compilerStderr = processCompileRequest(compiler, sys.argv)
     sys.stdout.write(compilerOutput)
+    sys.stderr.write(compilerStderr)
     return exitCode
 
 def processCompileRequest(compiler, args):

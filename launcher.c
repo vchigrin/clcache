@@ -7,6 +7,7 @@
 typedef struct tagRESULT_BLOCK_HEADER{
   DWORD exit_code;
   DWORD stdout_length;
+  DWORD stderr_length;
 }RESULT_BLOCK_HEADER;
 #pragma pack(pop)
 
@@ -30,12 +31,12 @@ int generate_pipe_name(wchar_t* dst, const wchar_t* clcache_dir) {
   return 1;
 }
 
-int transfer_to_stdout(HANDLE h_pipe, DWORD length) {
+int transfer_to_std_handle(HANDLE h_pipe, DWORD length, DWORD std_handle_id) {
   DWORD data_left = length;
   DWORD current_transfer_size = 0;
   static BYTE buffer[BUFFER_SIZE];
   DWORD bytes_transferred = 0;
-  HANDLE h_stdout = GetStdHandle(STD_OUTPUT_HANDLE);
+  HANDLE h_stdout = GetStdHandle(std_handle_id);
   while (data_left > 0) {
     current_transfer_size = data_left > BUFFER_SIZE ? BUFFER_SIZE : data_left;
     if (!ReadFile(
@@ -117,8 +118,10 @@ int try_do_work(const wchar_t* pipe_name, DWORD* exit_code) {
     return 0;
   if (!send_wstring(h_pipe, current_directory))
     return 0;
-  if (!send_wstring(h_pipe,  GetCommandLineW()))
+  if (!send_wstring(h_pipe,  GetCommandLineW())) {
+    fprintf(stderr, "Failed send command line\n");
     return 0;
+  }
 
   if (!ReadFile(
       h_pipe,
@@ -126,11 +129,15 @@ int try_do_work(const wchar_t* pipe_name, DWORD* exit_code) {
       sizeof(header),
       &bytes_transferred,
       NULL)) {
-    fprintf(stderr,"Unexpected error during reading from pipe %d.\n", GetLastError());
+    fprintf(stderr, "Unexpected error during reading from pipe %d.\n", GetLastError());
     return 0;
   }
   *exit_code = header.exit_code;
-  return transfer_to_stdout(h_pipe, header.stdout_length);
+  if (!transfer_to_std_handle(h_pipe, header.stdout_length, STD_OUTPUT_HANDLE))
+    return 0;
+  if (!transfer_to_std_handle(h_pipe, header.stderr_length, STD_ERROR_HANDLE))
+    return 0;
+  return 1;
 }
 
 int main(int argc, char* argv[]) {
