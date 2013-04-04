@@ -177,9 +177,15 @@ class ObjectCache:
         currentSize = stats.currentCacheSize()
         for hash in removedObjects:
             dirPath = os.path.join(self.dir, hash)
-            file_stat = os.stat(os.path.join(dirPath, "object"))
+            if not os.path.exists(dirPath):
+                continue  # May be if object already evicted.
+            objectPath = os.path.join(dirPath, "object")
+            if os.path.exists(objectPath):
+                # May be absent if this if cached compiler
+                # output (for preprocess-only).
+                fileStat = os.stat(objectPath)
+                currentSize -= fileStat.st_size
             rmtree(dirPath)
-            currentSize -= stat.st_size
         stats.setCacheSize(currentSize)
 
     def getManifestHash(self, compilerBinary, commandLine, sourceFile):
