@@ -161,7 +161,7 @@ class ObjectCache:
                    if "object" in files]
 
         objectInfos = [(os.stat(fn), fn) for fn in objects]
-        objectInfos.sort(key=lambda t: t[0].st_atime, reverse=True)
+        objectInfos.sort(key=lambda t: t[0].st_atime)
         for stat, fn in objectInfos:
             rmtree(os.path.split(fn)[0])
             currentSize -= stat.st_size
