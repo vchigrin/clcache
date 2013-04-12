@@ -60,7 +60,7 @@ BASEDIR_REPLACEMENT = '?'
 
 def cacheLock(cache):
     name = cache.cacheDirectory().replace(':', '-').replace('\\','-')
-    result = NamedLock(name, 100 * 1000)
+    result = NamedLock(name, NamedLock.INFINITE)
     return result
 
 # It is expected that during building we have only few possible
