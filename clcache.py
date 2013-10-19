@@ -66,6 +66,7 @@ def cacheLock(cache):
 # It is expected that during building we have only few possible
 # PATH variants, so caching should work great here in dameon mode.
 COMPILER_PATH_CACHE = {}
+VERIFIED_COMPILER_HINTS = set()
 
 # Many source files will include the same includes (e.g system includes).
 # We will cache their hashes based on path and file modification time, to
@@ -500,7 +501,13 @@ def getHash(data):
     sha.update(data)
     return sha.hexdigest()
 
-def findCompilerBinary(pathVariable):
+def findCompilerBinary(pathVariable, hint):
+    if hint:
+        if hint in VERIFIED_COMPILER_HINTS:
+            return hint
+        if os.path.isfile(hint):
+            VERIFIED_COMPILER_HINTS.add(hint)
+            return hint
     compiler = COMPILER_PATH_CACHE.get(pathVariable)
     if compiler:
         return compiler
@@ -1009,13 +1016,18 @@ def serveClient(hPipe):
     # TODO: it is better to use it as argument of Popen instead.
     os.environ['PATH'] = pathVariable
     os.environ['INCLUDE'] = includeVariable
-    compiler = findCompilerBinary(pathVariable)
+    expandedCommandLine = splitCommandsFile(commandLine)
+    compilerHint = None
+    if expandedCommandLine[1] == '/COMPILER:':
+        compilerHint = expandedCommandLine[2]
+        del expandedCommandLine[1:3]
+    compiler = findCompilerBinary(pathVariable, compilerHint)
     if not compiler:
         print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
         exitCode = 1
         stdoutData = ''
     else:
-        exitCode, stdoutData, stderrData = processCompileRequest(compiler, splitCommandsFile(commandLine))
+        exitCode, stdoutData, stderrData = processCompileRequest(compiler, expandedCommandLine)
     response = struct.pack('@III', exitCode, len(stdoutData), len(stderrData))
     response += stdoutData
     response += stderrData
@@ -1164,7 +1176,7 @@ def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--kill-cacodaemons":
         killCacodaemons()
         return 0
-    compiler = findCompilerBinary(os.environ["PATH"])
+    compiler = findCompilerBinary(os.environ["PATH"], None)
     if not compiler:
         print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
         return 1
