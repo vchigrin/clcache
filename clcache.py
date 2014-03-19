@@ -1223,6 +1223,7 @@ def processCompileRequest(compiler, args):
     baseDir = os.environ.get('CLCACHE_BASEDIR')
     if baseDir and not baseDir.endswith(os.path.sep):
         baseDir += os.path.sep
+    hasMissedHeader = False
     if manifest is not None:
         # NOTE: command line options already included in hash for manifest name
         listOfHashes = []
@@ -1232,6 +1233,23 @@ def processCompileRequest(compiler, args):
                 # May be if source does not use this header anymore (e.g. if that
                 # header was included through some other header, which now changed).
                 listOfHashes.append(fileHash)
+            else:
+                hasMissedHeader = True
+                break
+        # If includes set changed, we MUST re-create manifest, on other case
+        # following problem may appear:
+        # 1. file.cpp uses #include "header.h" and compiled with -I dir -I dir\subdir
+        # 2. First time header.h is found in dir\, so it saved to manifest
+        # 3. Build directory cleared, header.h moved to dir\subdir
+        # 4. Now we don't found dir\header.h, so run real compiler and cache
+        #    result NOT USING header.h hash AT ALL
+        # 5. Build directory clean again, header.h still in dir\subdir,
+        #    but has changed it contents
+        # 6. We still using manifest from step 2, we still do not use hash for
+        #    header.h, so use cached result from step 4,
+        #    which is incorrect.
+        if hasMissedHeader:
+            return processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine, sourceFile)
         includesKey = getHash(','.join(listOfHashes))
         cachekey = manifest.hashes.get(includesKey)
         if cachekey is not None:
