@@ -721,6 +721,9 @@ def analyzeCommandLine(cmdline):
 
 def invokeRealCompiler(compilerBinary, cmdLine, captureOutput=False):
     realCmdline = [compilerBinary] + cmdLine
+    if not '/showIncludes' in realCmdline:
+        realCmdline.append('/showIncludes')
+
     printTraceStatement("Invoking real compiler as '%s'" % ' '.join(realCmdline))
 
     returnCode = None
