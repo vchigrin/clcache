@@ -2,7 +2,7 @@
 #
 # clcache.py - a compiler cache for Microsoft Visual Studio
 #
-# Copyright (c) 2010, 2011, 2012 froglogic GmbH <raabe@froglogic.com>
+# Copyright (c) 2010, 2011, 2012, 2013 froglogic GmbH <raabe@froglogic.com>
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -27,11 +27,10 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 # SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
+from ctypes import windll, wintypes
 import codecs
 from collections import defaultdict, namedtuple
 import cPickle as pickle
-import ctypes
-
 import hashlib
 import json
 import os
@@ -44,24 +43,25 @@ import tempfile
 import multiprocessing
 import re
 
-Manifest = namedtuple('Manifest', ['includeFiles', 'hashes'])
+HASH_ALGORITHM = hashlib.md5
 
-# Manifest file will have at most this number of hash lists in it. Need to avoid
+# Manifest file will have at most this number of hash lists in it. Need to avoi
 # manifests grow too large.
 MAX_MANIFEST_HASHES = 100
-
-# Size of buffers or pipes, used by daemons.
-PIPE_BUFFER_SIZE = 1024
 
 # String, by which BASE_DIR will be replaced in paths, stored in manifests.
 # ? is invalid character for file name, so it seems ok
 # to use it as mark for relative path.
 BASEDIR_REPLACEMENT = '?'
 
-def cacheLock(cache):
-    name = cache.cacheDirectory().replace(':', '-').replace('\\','-')
-    result = NamedLock(name, NamedLock.INFINITE)
-    return result
+# Size of buffers or pipes, used by daemons.
+PIPE_BUFFER_SIZE = 1024
+
+# includeFiles - list of paths toi include files, which this source file use.
+# hashes - dictionary.
+# Key - cumulative hash of all include files in includeFiles;
+# Value - key in the cache, under which output file is stored.
+Manifest = namedtuple('Manifest', ['includeFiles', 'hashes'])
 
 # It is expected that during building we have only few possible
 # PATH variants, so caching should work great here in dameon mode.
@@ -79,21 +79,27 @@ HEADER_HASH_CACHE = {}
 def get_header_key(path, mtime):
     return '{mtime}:{path}'.format(mtime=mtime, path=path)
 
-
-class LockException(Exception):
+class ObjectCacheLockException(Exception):
     pass
 
-class NamedLock:
-    """Wrapper around named mutex in session namespace.
-    """
+class LogicException(Exception):
+    def __init__(self, message):
+        self.value = message
+
+    def __str__(self):
+        return repr(self.message)
+
+class ObjectCacheLock:
+    """ Implements a lock for the object cache which
+    can be used in 'with' statements. """
     INFINITE = 0xFFFFFFFF
 
     def __init__(self, mutexName, timeoutMs):
         mutexName = 'Local\\' + mutexName
-        self._mutex = ctypes.windll.kernel32.CreateMutexW(
-            ctypes.c_int(0),
-            ctypes.c_int(0),
-            ctypes.c_wchar_p(mutexName))
+        self._mutex = windll.kernel32.CreateMutexW(
+            wintypes.c_int(0),
+            wintypes.c_int(0),
+            unicode(mutexName))
         self._timeoutMs = timeoutMs
         self._acquired = False
         assert self._mutex
@@ -107,23 +113,22 @@ class NamedLock:
             self.release()
 
     def __del__(self):
-        ctypes.windll.kernel32.CloseHandle(self._mutex)
+        windll.kernel32.CloseHandle(self._mutex)
 
     def acquire(self):
         WAIT_ABANDONED = 0x00000080
-        result = ctypes.windll.kernel32.WaitForSingleObject(
-            self._mutex, ctypes.c_int(self._timeoutMs))
+        result = windll.kernel32.WaitForSingleObject(
+            self._mutex, wintypes.c_int(self._timeoutMs))
         if result != 0 and result != WAIT_ABANDONED:
             errorString ='Error! WaitForSingleObject returns {result}, last error {error}'.format(
                 result=result,
-                error=ctypes.windll.kernel32.GetLastError())
-            raise LockException(errorString)
+                error=windll.kernel32.GetLastError())
+            raise ObjectCacheLockException(errorString)
         self._acquired = True
 
     def release(self):
-        ctypes.windll.kernel32.ReleaseMutex(self._mutex)
+        windll.kernel32.ReleaseMutex(self._mutex)
         self._acquired = False
-
 
 class ObjectCache:
     def __init__(self):
@@ -131,63 +136,76 @@ class ObjectCache:
             self.dir = os.environ["CLCACHE_DIR"]
         except KeyError:
             self.dir = os.path.join(os.path.expanduser("~"), "clcache")
+        lockName = self.cacheDirectory().replace(':', '-').replace('\\', '-')
+        self.lock = ObjectCacheLock(lockName, 10 * 1000)
+
         self.tempDir = os.path.join(self.dir, '.temp')
         self.daemonsDir = os.path.join(self.dir, '.daemons')
+        self.manifestsDir = os.path.join(self.dir, "manifests")
+        self.objectsDir = os.path.join(self.dir, "objects")
 
         # Creates both self.dir and self.tempDir if neccessary
-        if not (os.path.exists(self.tempDir) and os.path.exists(self.daemonsDir)):
+        if (not (os.path.exists(self.tempDir)) or
+            not (os.path.exists(self.daemonsDir)) or
+            not (os.path.exists(self.manifestsDir)) or
+            not (os.path.exists(self.objectsDir))):
         # Guarded by lock to avoid exceptions when multiple processes started
         # and try to create the same dir.
-            with cacheLock(self):
+            with self.lock:
                 if not os.path.exists(self.tempDir):
                     os.makedirs(self.tempDir)
                 if not os.path.exists(self.daemonsDir):
                     os.makedirs(self.daemonsDir)
+                if not os.path.exists(self.manifestsDir):
+                    os.makedirs(self.manifestsDir)
+                if not os.path.exists(self.objectsDir):
+                    os.makedirs(self.objectsDir)
 
     def cacheDirectory(self):
         return self.dir
 
     def clean(self, stats, maximumSize):
-        # Ensure other processes will not touch cache during cleaning
-        stats.ensureLoadedAndLocked()
-        currentSize = stats.currentCacheSize()
-        if currentSize < maximumSize:
-            return
-        # Free at least 10% to avoid too often cleanups and performance degradation
-        # on large caches.
-        maxSizeAfterCleanup = maximumSize * 0.9
+        with self.lock:
+            currentSize = stats.currentCacheSize()
+            if currentSize < maximumSize:
+                return
 
-        objects = [os.path.join(root, "object")
-                   for root, folder, files in os.walk(self.dir)
-                   if "object" in files]
+            # Free at least 10% to avoid cleaning up too often which
+            # is a big performance hit with large caches.
+            effectiveMaximumSize = maximumSize * 0.9
 
-        objectInfos = [(os.stat(fn), fn) for fn in objects]
-        objectInfos.sort(key=lambda t: t[0].st_atime)
-        for stat, fn in objectInfos:
-            rmtree(os.path.split(fn)[0])
-            currentSize -= stat.st_size
-            if currentSize < maxSizeAfterCleanup:
-                break
-        stats.setCacheSize(currentSize)
+            objects = [os.path.join(root, "object")
+                       for root, folder, files in os.walk(self.objectsDir)
+                       if "object" in files]
+
+            objectInfos = [(os.stat(fn), fn) for fn in objects]
+            objectInfos.sort(key=lambda t: t[0].st_atime)
+
+            for stat, fn in objectInfos:
+                rmtree(os.path.split(fn)[0])
+                currentSize -= stat.st_size
+                if currentSize < effectiveMaximumSize:
+                    break
+
+            stats.setCacheSize(currentSize)
 
     def removeObjects(self, stats, removedObjects):
         if len(removedObjects) == 0:
             return
-        # Ensure other processes will not touch cache during cleaning
-        stats.ensureLoadedAndLocked()
-        currentSize = stats.currentCacheSize()
-        for hash in removedObjects:
-            dirPath = os.path.join(self.dir, hash)
-            if not os.path.exists(dirPath):
-                continue  # May be if object already evicted.
-            objectPath = os.path.join(dirPath, "object")
-            if os.path.exists(objectPath):
-                # May be absent if this if cached compiler
-                # output (for preprocess-only).
-                fileStat = os.stat(objectPath)
-                currentSize -= fileStat.st_size
-            rmtree(dirPath)
-        stats.setCacheSize(currentSize)
+        with self.lock:
+            currentSize = stats.currentCacheSize()
+            for hash in removedObjects:
+                dirPath = self._cacheEntryDir(hash)
+                if not os.path.exists(dirPath):
+                    continue  # May be if object already evicted.
+                objectPath = os.path.join(dirPath, "object")
+                if os.path.exists(objectPath):
+                    # May be absent if this if cached compiler
+                    # output (for preprocess-only).
+                    fileStat = os.stat(objectPath)
+                    currentSize -= fileStat.st_size
+                rmtree(dirPath)
+            stats.setCacheSize(currentSize)
 
     def getManifestHash(self, compilerBinary, commandLine, sourceFile):
         stat = os.stat(compilerBinary)
@@ -200,33 +218,68 @@ class ObjectCache:
             cmdLine=' '.join(commandLine));
         return getFileHash(sourceFile, additionalData)
 
+    def computeKey(self, compilerBinary, commandLine):
+        ppcmd = [compilerBinary, "/EP"]
+        ppcmd += [arg for arg in commandLine if not arg in ("-c", "/c")]
+        preprocessor = Popen(ppcmd, stdout=PIPE, stderr=PIPE)
+        (preprocessedSourceCode, pperr) = preprocessor.communicate()
+
+        if preprocessor.returncode != 0:
+            sys.stderr.write(pperr)
+            sys.stderr.write("clcache: preprocessor failed\n")
+            sys.exit(preprocessor.returncode)
+
+        normalizedCmdLine = self._normalizedCommandLine(commandLine)
+
+        stat = os.stat(compilerBinary)
+        h = HASH_ALGORITHM()
+        h.update(str(stat.st_mtime))
+        h.update(str(stat.st_size))
+        h.update(' '.join(normalizedCmdLine))
+        h.update(preprocessedSourceCode)
+        return h.hexdigest()
+
+    def getKeyInManifest(self, listOfHeaderHashes):
+        return getHash(','.join(listOfHeaderHashes))
+
+    def getDirectCacheKey(self, manifestHash, keyInManifest):
+        # We must take into account manifestHash to avoid
+        # collisions when different source files use the same
+        # set of includes.
+        return getHash(manifestHash + keyInManifest)
+
     def hasEntry(self, key):
-        return os.path.exists(self.cachedObjectName(key)) or os.path.exists(self._cachedCompilerOutputName(key))
+        with self.lock:
+            return os.path.exists(self.cachedObjectName(key)) or os.path.exists(self._cachedCompilerOutputName(key))
 
     def setEntry(self, key, objectFileName, compilerOutput, compilerStderr):
-        if not os.path.exists(self._cacheEntryDir(key)):
-            os.makedirs(self._cacheEntryDir(key))
-        if objectFileName != '':
-            copyOrLink(objectFileName, self.cachedObjectName(key))
-        open(self._cachedCompilerOutputName(key), 'w').write(compilerOutput)
-        if compilerStderr != '':
-            open(self._cachedCompilerStderrName(key), 'w').write(compilerStderr)
+        with self.lock:
+            if not os.path.exists(self._cacheEntryDir(key)):
+                os.makedirs(self._cacheEntryDir(key))
+            if objectFileName != '':
+                copyOrLink(objectFileName, self.cachedObjectName(key))
+            open(self._cachedCompilerOutputName(key), 'w').write(compilerOutput)
+            if compilerStderr != '':
+                open(self._cachedCompilerStderrName(key), 'w').write(compilerStderr)
 
     def setManifest(self, manifestHash, manifest):
-        if not os.path.exists(self._cacheEntryDir(manifestHash)):
-            os.makedirs(self._cacheEntryDir(manifestHash))
-        with open(self._manifestName(manifestHash), 'wb') as outFile:
-            pickle.dump(manifest, outFile)
+        with self.lock:
+            if not os.path.exists(self._manifestDir(manifestHash)):
+                os.makedirs(self._manifestDir(manifestHash))
+            with open(self._manifestName(manifestHash), 'wb') as outFile:
+                pickle.dump(manifest, outFile)
 
     def getManifest(self, manifestHash):
-        fileName = self._manifestName(manifestHash)
-        if not os.path.exists(fileName):
-            return None
-        # TODO: Locking if somebody decide compile the same file with the same
-        # options on the same cache (A bit paranoid situation)
-        with open(fileName, 'rb') as inFile:
-            return pickle.load(inFile)
-        return manifest
+        with self.lock:
+            fileName = self._manifestName(manifestHash)
+            if not os.path.exists(fileName):
+                return None
+            with open(fileName, 'rb') as inFile:
+                try:
+                    return pickle.load(inFile)
+                except:
+                    # Seems, file is corrupted
+                    return None
 
     def cachedObjectName(self, key):
         return os.path.join(self._cacheEntryDir(key), "object")
@@ -250,29 +303,32 @@ class ObjectCache:
         return os.path.join(self.daemonsDir, str(daemonPid))
 
     def regiterDaemon(self, daemonPid):
-        with cacheLock(self):
+        with self.lock:
             os.makedirs(self.getDaemonDir(daemonPid))
 
     def unregiterDaemon(self, daemonPid):
-        with cacheLock(self):
+        with self.lock:
             rmtree(self.getDaemonDir(daemonPid))
 
     def getAllDaemonPids(self):
-        with cacheLock(self):
+        with self.lock:
             dirs = os.listdir(self.daemonsDir)
         return [int(d) for d in dirs]
 
     def _cacheEntryDir(self, key):
-        return os.path.join(self.dir, key[:2], key)
+        return os.path.join(self.objectsDir, key[:2], key)
+
+    def _manifestDir(self, manifestHash):
+        return os.path.join(self.manifestsDir, manifestHash[:2])
+
+    def _manifestName(self, manifestHash):
+        return os.path.join(self._manifestDir(manifestHash), manifestHash + ".dat")
 
     def _cachedCompilerOutputName(self, key):
         return os.path.join(self._cacheEntryDir(key), "output.txt")
 
     def _cachedCompilerStderrName(self, key):
         return os.path.join(self._cacheEntryDir(key), "stderr.txt")
-
-    def _manifestName(self, key):
-        return os.path.join(self._cacheEntryDir(key), "manifest.dat")
 
     def _normalizedCommandLine(self, cmdline):
         # Remove all arguments from the command line which only influence the
@@ -319,8 +375,10 @@ class Configuration:
     _defaultValues = { "MaximumCacheSize": 1024 * 1024 * 1000 }
 
     def __init__(self, objectCache):
-        self._cfg = PersistentJSONDict(os.path.join(objectCache.cacheDirectory(),
-                                                    "config.txt"))
+        self._objectCache = objectCache
+        with objectCache.lock:
+            self._cfg = PersistentJSONDict(os.path.join(objectCache.cacheDirectory(),
+                                                        "config.txt"))
         for setting, defaultValue in self._defaultValues.iteritems():
             if not setting in self._cfg:
                 self._cfg[setting] = defaultValue
@@ -332,107 +390,16 @@ class Configuration:
         self._cfg["MaximumCacheSize"] = size
 
     def save(self):
-        self._cfg.save()
+        with self._objectCache.lock:
+            self._cfg.save()
 
 
 class CacheStatistics:
-    def __init__(self, objectCache, cacheLock):
-        # Use two dictionaries to ensure we'll grab cache lock on the smallest
-        # possible time. We collect increment _incremental_stats while possible
-        # and then merge it with stats on disk.
-        self._incremental_stats = defaultdict(int)
-        self._stats = None
-        self._cacheLock = cacheLock
-        self._objectCache = objectCache
-
-    def numCallsWithoutSourceFile(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CallsWithoutSourceFile"]
-
-    def registerCallWithoutSourceFile(self):
-        self._incremental_stats["CallsWithoutSourceFile"] += 1
-
-    def numCallsWithMultipleSourceFiles(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CallsWithMultipleSourceFiles"]
-
-    def registerCallWithMultipleSourceFiles(self):
-        self._incremental_stats["CallsWithMultipleSourceFiles"] += 1
-
-    def numCallsWithPch(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CallsWithPch"]
-
-    def registerCallWithPch(self):
-        self._incremental_stats["CallsWithPch"] += 1
-
-    def numCallsForLinking(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CallsForLinking"]
-
-    def registerCallForLinking(self):
-        self._incremental_stats["CallsForLinking"] += 1
-
-    def numEvictedMisses(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["EvictedMisses"]
-
-    def registerEvictedMiss(self):
-        self._registerCacheMiss()
-        self._incremental_stats["EvictedMisses"] += 1
-
-    def numHeaderChangedMisses(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["HeaderChangedMisses"]
-
-    def registerHeaderChangedMiss(self):
-        self._registerCacheMiss()
-        self._incremental_stats["HeaderChangedMisses"] += 1
-
-    def numSourceChangedMisses(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["SourceChangedMisses"]
-
-    def registerSourceChangedMiss(self):
-        self._registerCacheMiss()
-        self._incremental_stats["SourceChangedMisses"] += 1
-
-    def numCacheEntries(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CacheEntries"]
-
-    def registerCacheEntry(self, size):
-        self._incremental_stats["CacheEntries"] += 1
-        self._incremental_stats["CacheSize"] += size
-
-    def currentCacheSize(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CacheSize"]
-
-    def setCacheSize(self, size):
-        self.ensureLoadedAndLocked()
-        self._stats["CacheSize"] = size
-
-    def numCacheHits(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CacheHits"]
-
-    def registerCacheHit(self):
-        self._incremental_stats["CacheHits"] += 1
-
-    def numCacheMisses(self):
-        self.ensureLoadedAndLocked()
-        return self._stats["CacheMisses"]
-
-    def _registerCacheMiss(self):
-        self._incremental_stats["CacheMisses"] += 1
-
-    def ensureLoadedAndLocked(self):
-        if self._stats:
-            return
-        self._cacheLock.acquire()
-        self._stats = PersistentJSONDict(os.path.join(self._objectCache.cacheDirectory(),
-                                                      "stats.txt"))
+    def __init__(self, objectCache):
+        self.objectCache = objectCache
+        with objectCache.lock:
+            self._stats = PersistentJSONDict(os.path.join(objectCache.cacheDirectory(),
+                                                          "stats.txt"))
         for k in ["CallsWithoutSourceFile",
                   "CallsWithMultipleSourceFiles",
                   "CallsWithPch",
@@ -443,12 +410,78 @@ class CacheStatistics:
                   "SourceChangedMisses"]:
             if not k in self._stats:
                 self._stats[k] = 0
-        for key, value in self._incremental_stats.items():
-            self._stats[key] += value
-        self._incremental_stats = defaultdict(int)
+
+    def numCallsWithoutSourceFile(self):
+        return self._stats["CallsWithoutSourceFile"]
+
+    def registerCallWithoutSourceFile(self):
+        self._stats["CallsWithoutSourceFile"] += 1
+
+    def numCallsWithMultipleSourceFiles(self):
+        return self._stats["CallsWithMultipleSourceFiles"]
+
+    def registerCallWithMultipleSourceFiles(self):
+        self._stats["CallsWithMultipleSourceFiles"] += 1
+
+    def numCallsWithPch(self):
+        return self._stats["CallsWithPch"]
+
+    def registerCallWithPch(self):
+        self._stats["CallsWithPch"] += 1
+
+    def numCallsForLinking(self):
+        return self._stats["CallsForLinking"]
+
+    def registerCallForLinking(self):
+        self._stats["CallsForLinking"] += 1
+
+    def numEvictedMisses(self):
+        return self._stats["EvictedMisses"]
+
+    def registerEvictedMiss(self):
+        self.registerCacheMiss()
+        self._stats["EvictedMisses"] += 1
+
+    def numHeaderChangedMisses(self):
+        return self._stats["HeaderChangedMisses"]
+
+    def registerHeaderChangedMiss(self):
+        self.registerCacheMiss()
+        self._stats["HeaderChangedMisses"] += 1
+
+    def numSourceChangedMisses(self):
+        return self._stats["SourceChangedMisses"]
+
+    def registerSourceChangedMiss(self):
+        self.registerCacheMiss()
+        self._stats["SourceChangedMisses"] += 1
+
+    def numCacheEntries(self):
+        return self._stats["CacheEntries"]
+
+    def registerCacheEntry(self, size):
+        self._stats["CacheEntries"] += 1
+        self._stats["CacheSize"] += size
+
+    def currentCacheSize(self):
+        return self._stats["CacheSize"]
+
+    def setCacheSize(self, size):
+        self._stats["CacheSize"] = size
+
+    def numCacheHits(self):
+        return self._stats["CacheHits"]
+
+    def registerCacheHit(self):
+        self._stats["CacheHits"] += 1
+
+    def numCacheMisses(self):
+        return self._stats["CacheMisses"]
+
+    def registerCacheMiss(self):
+        self._stats["CacheMisses"] += 1
 
     def resetCounters(self):
-        self.ensureLoadedAndLocked()
         for k in ["CallsWithoutSourceFile",
                   "CallsWithMultipleSourceFiles",
                   "CallsWithPch",
@@ -459,32 +492,27 @@ class CacheStatistics:
             self._stats[k] = 0
 
     def save(self):
-        self.ensureLoadedAndLocked()
-        self._stats.save()
-        self._cacheLock.release()
-        self._stats = None  # Force reload stats when we'll re-acuire lock
-
-
+        with self.objectCache.lock:
+            self._stats.save()
 
 class AnalysisResult:
     Ok, NoSourceFile, MultipleSourceFilesSimple, \
         MultipleSourceFilesComplex, CalledForLink, \
-        CalledWithPch = range(6)
+        CalledWithPch, ExternalDebugInfo = range(7)
 
 def getFileHash(filePath, additionalData = None):
-    sha = hashlib.sha1()
+    hasher = HASH_ALGORITHM()
     with open(filePath, 'rb') as inFile:
-        sha.update(inFile.read())
+        hasher.update(inFile.read())
     if additionalData is not None:
-        sha.update(additionalData)
-    return sha.hexdigest()
+        hasher.update(additionalData)
+    return hasher.hexdigest()
 
 def getRelFileHash(filePath, baseDir):
     absFilePath = filePath
     if absFilePath.startswith(BASEDIR_REPLACEMENT):
         if not baseDir:
-            sys.stderr.write('No CLCACHE_BASEDIR set, but found relative path ' + filePath)
-            sys.exit(1)
+            raise LogicException('No CLCACHE_BASEDIR set, but found relative path ' + filePath)
         absFilePath = absFilePath.replace(BASEDIR_REPLACEMENT, baseDir, 1)
     if not os.path.exists(absFilePath):
         return None
@@ -497,9 +525,26 @@ def getRelFileHash(filePath, baseDir):
     return result
 
 def getHash(data):
-    sha = hashlib.sha1()
-    sha.update(data)
-    return sha.hexdigest()
+    hasher = HASH_ALGORITHM()
+    hasher.update(data)
+    return hasher.hexdigest()
+
+def copyOrLink(srcFilePath, dstFilePath):
+    if "CLCACHE_HARDLINK" in os.environ:
+        ret = windll.kernel32.CreateHardLinkW(unicode(dstFilePath), unicode(srcFilePath), None)
+        if ret != 0:
+            # Touch the time stamp of the new link so that the build system
+            # doesn't confused by a potentially old time on the file. The
+            # hard link gets the same timestamp as the cached file.
+            # Note that touching the time stamp of the link also touches
+            # the time stamp on the cache (and hence on all over hard
+            # links). This shouldn't be a problem though.
+            os.utime(dstFilePath, None)
+            return
+
+    # If hardlinking fails for some reason (or it's not enabled), just
+    # fall back to moving bytes around...
+    copyfile(srcFilePath, dstFilePath)
 
 def findCompilerBinary(pathVariable, hint):
     if hint:
@@ -511,33 +556,31 @@ def findCompilerBinary(pathVariable, hint):
     compiler = COMPILER_PATH_CACHE.get(pathVariable)
     if compiler:
         return compiler
-    try:
+    compiler = findCompilerBinaryImpl(pathVariable)
+    if compiler:
+        COMPILER_PATH_CACHE[pathVariable] = compiler
+    return compiler
+
+def findCompilerBinaryImpl(pathVariable):
+    if "CLCACHE_CL" in os.environ:
         path = os.environ["CLCACHE_CL"]
+        return path if os.path.exists(path) else None
+
+    frozenByPy2Exe = hasattr(sys, "frozen")
+    if frozenByPy2Exe:
+        myExecutablePath = unicode(sys.executable, sys.getfilesystemencoding()).upper()
+
+    for dir in pathVariable.split(os.pathsep):
+        path = os.path.join(dir, "cl.exe")
         if os.path.exists(path):
-            COMPILER_PATH_CACHE[pathVariable] = path
-            return path
-    except KeyError:
-        for dir in pathVariable.split(os.pathsep):
-            path = os.path.join(dir, "cl.exe")
-            if os.path.exists(path):
-                COMPILER_PATH_CACHE[pathVariable] = path
+            if not frozenByPy2Exe:
+                return path
+
+            # Guard against recursively calling ourselves
+            if path.upper() != myExecutablePath:
                 return path
     return None
 
-def copyOrLink(srcFilePath, dstFilePath):
-    if 'CLCACHE_HARDLINK' in os.environ:
-        ok = ctypes.windll.kernel32.CreateHardLinkW(unicode(dstFilePath), unicode(srcFilePath), None)
-        if ok != 0:
-            # Freshen file times to ensure build tool will not be surprised by
-            # "old" file. Note, that this also changes time of file in cache and
-            # theoretically, in other directories too.
-            os.utime(dstFilePath, None)
-            return
-        sys.stderr.write('clcache warning: Failed hardlink {src} to {dst}. Error {error}. Try to copy file\n'.format(
-            src=srcFilePath,
-            dst=dstFilePath,
-            error=ctypes.windll.kernel32.GetLastError()))
-    copyfile(srcFilePath, dstFilePath)
 
 def printTraceStatement(msg):
     if "CLCACHE_LOG" in os.environ:
@@ -550,7 +593,8 @@ def extractArgument(line, start, end):
     if line[start] == '"' and line[end-1] == '"' and start != (end-1):
         start += 1
         end -= 1
-    return line[start:end].replace('\\"','"')
+    # Unescape quotes.
+    return line[start:end].replace('\\"','"').strip()
 
 def splitCommandsFile(line):
     # Note, we must treat lines in quotes as one argument. We do not use shlex
@@ -560,14 +604,14 @@ def splitCommandsFile(line):
     # -I..\\.. -I"..\\..\\lib" -DMYPATH=\\"C:\\Path\\"'
     i = 0
     wordStart = -1
-    inside_quotes = False
+    insideQuotes = False
     result = []
     while i < len(line):
-        if line[i] == ' ' and not inside_quotes and wordStart >= 0:
+        if line[i] == ' ' and not insideQuotes and wordStart >= 0:
             result.append(extractArgument(line, wordStart, i))
             wordStart = -1
         if line[i] == '"' and ((i == 0) or (i > 0 and line[i - 1] != '\\')):
-            inside_quotes = not inside_quotes
+            insideQuotes = not insideQuotes
         if line[i] != ' ' and wordStart < 0:
             wordStart = i
         i += 1
@@ -602,7 +646,7 @@ def expandCommandLine(cmdline):
 
             includeFileContents = rawBytes.decode(encoding) if encoding is not None else rawBytes
 
-            ret.extend(expandCommandLine(splitCommandsFile(includeFileContents)))
+            ret.extend(expandCommandLine(splitCommandsFile(includeFileContents.strip())))
         else:
             ret.append(arg)
 
@@ -657,6 +701,10 @@ def analyzeCommandLine(cmdline):
     options, responseFile, sourceFiles = parseCommandLine(cmdline)
     compl = False
 
+    # Technically, it would be possible to support /Zi: we'd just need to
+    # copy the generated .pdb files into/out of the cache.
+    if 'Zi' in options:
+        return AnalysisResult.ExternalDebugInfo, None, None
     if 'Yu' in options:
         return AnalysisResult.CalledWithPch, None, None
     if 'Tp' in options:
@@ -687,6 +735,11 @@ def analyzeCommandLine(cmdline):
     outputFile = None
     if 'Fo' in options:
         outputFile = options['Fo'][0]
+
+        if os.path.isdir(outputFile):
+            srcFileName = os.path.basename(sourceFiles[0])
+            outputFile = os.path.join(outputFile,
+                                      os.path.splitext(srcFileName)[0] + ".obj")
     elif preprocessing:
         if 'P' in options:
             # Prerpocess to file.
@@ -705,10 +758,6 @@ def analyzeCommandLine(cmdline):
         outputFile = os.path.join(os.getcwd(),
                                   os.path.splitext(srcFileName)[0] + ".obj")
 
-    if os.path.isdir(outputFile):
-        srcFileName = os.path.basename(sourceFiles[0])
-        outputFile = os.path.join(outputFile,
-                                 os.path.splitext(srcFileName)[0] + ".obj")
     # Strip quotes around file names; seems to happen with source files
     # with spaces in their names specified via a response file generated
     # by Visual Studio.
@@ -727,15 +776,14 @@ def invokeRealCompiler(compilerBinary, cmdLine, captureOutput=False):
     printTraceStatement("Invoking real compiler as '%s'" % ' '.join(realCmdline))
 
     returnCode = None
-    output = None
+    stdout = ''
+    stderr = ''
     if captureOutput:
-        compilerProcess = Popen(realCmdline, stdout=PIPE, stderr=PIPE)
+        compilerProcess = Popen(realCmdline, universal_newlines=True, stdout=PIPE, stderr=PIPE)
         stdout, stderr = compilerProcess.communicate()
-        stdout = stdout.replace('\r\n','\n')
-        stderr = stderr.replace('\r\n','\n')
         returnCode = compilerProcess.returncode
     else:
-        returnCode = subprocess.call(realCmdline)
+        returnCode = subprocess.call(realCmdline, universal_newlines=True)
 
     printTraceStatement("Real compiler returned code %d" % returnCode)
     return returnCode, stdout, stderr
@@ -750,8 +798,8 @@ def waitForAnyProcess(procs):
     out = [p for p in procs if p.poll() != None]
     if len(out) >= 1:
         out = out[0]
-	procs.remove(out)
-	return out
+        procs.remove(out)
+        return out
 
     # Damn, none finished yet.
     # Do a blocking wait for the first one.
@@ -825,7 +873,9 @@ def reinvokePerSourceFile(cmdLine, sourceFiles):
     commands = []
     for sourceFile in sourceFiles:
         # The child command consists of clcache.py ...
-        newCmdLine = [sys.executable, sys.argv[0]]
+        newCmdLine = [sys.executable]
+        if not hasattr(sys, "frozen"):
+            newCmdLine.append(sys.argv[0])
 
         for arg in cmdLine:
             # and the current source file ...
@@ -843,9 +893,10 @@ def reinvokePerSourceFile(cmdLine, sourceFiles):
 
 def printStatistics():
     cache = ObjectCache()
-    stats = CacheStatistics(cache, cacheLock(cache))
-    cfg = Configuration(cache)
-    print """clcache statistics:
+    with cache.lock:
+        stats = CacheStatistics(cache)
+        cfg = Configuration(cache)
+        print """clcache statistics:
   current cache dir        : %s
   cache size               : %d bytes
   maximum cache size       : %d bytes
@@ -860,32 +911,33 @@ def printStatistics():
   header changed misses    : %d
   source changed misses    : %d
   """ % (
-       cache.cacheDirectory(),
-       stats.currentCacheSize(),
-       cfg.maximumCacheSize(),
-       stats.numCacheEntries(),
-       stats.numCacheHits(),
-       stats.numCacheMisses(),
-       stats.numCallsForLinking(),
-       stats.numCallsWithoutSourceFile(),
-       stats.numCallsWithMultipleSourceFiles(),
-       stats.numCallsWithPch(),
-       stats.numEvictedMisses(),
-       stats.numHeaderChangedMisses(),
-       stats.numSourceChangedMisses())
+           cache.cacheDirectory(),
+           stats.currentCacheSize(),
+           cfg.maximumCacheSize(),
+           stats.numCacheEntries(),
+           stats.numCacheHits(),
+           stats.numCacheMisses(),
+           stats.numCallsForLinking(),
+           stats.numCallsWithoutSourceFile(),
+           stats.numCallsWithMultipleSourceFiles(),
+           stats.numCallsWithPch(),
+           stats.numEvictedMisses(),
+           stats.numHeaderChangedMisses(),
+           stats.numSourceChangedMisses())
 
 def resetStatistics():
-  cache = ObjectCache()
-  stats = CacheStatistics(cache, cacheLock(cache))
-  stats.resetCounters()
-  stats.save()
-  print 'Statistics reset'
+    cache = ObjectCache()
+    with cache.lock:
+        stats = CacheStatistics(cache)
+        stats.resetCounters()
+        stats.save()
+    print 'Statistics reset'
 
 # Returns pair - list of includes and new compiler output.
 # Output changes if strip is True in that case all lines with include
 # directives are stripped from it
 def getIncludes(compilerOutput, sourceFile, baseDir, strip):
-    newOutput = ''
+    newOutput = []
     includesSet = set([])
     reFilePath = re.compile('^Note: including file: *(?P<file_path>.+)$')
     absSourceFile = os.path.normcase(os.path.abspath(sourceFile))
@@ -895,15 +947,15 @@ def getIncludes(compilerOutput, sourceFile, baseDir, strip):
         match = reFilePath.match(line.rstrip('\r\n'))
         if match is not None:
             filePath = match.group('file_path')
-            filePath = os.path.normcase(filePath)
+            filePath = os.path.normcase(os.path.abspath(filePath))
             if filePath != absSourceFile:
                 if baseDir and filePath.startswith(baseDir):
                     filePath = filePath.replace(baseDir, BASEDIR_REPLACEMENT, 1)
                 includesSet.add(filePath)
         elif strip:
-            newOutput += line
+            newOutput.append(line)
     if strip:
-        return list(includesSet), newOutput
+        return list(includesSet), '\n'.join(newOutput)
     else:
         return list(includesSet), compilerOutput
 
@@ -941,8 +993,8 @@ def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine):
     printTraceStatement("Finished. Exit code %d" % returnCode)
     return returnCode, compilerOutput, compilerStderr
 
-def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine, sourceFile):
-    cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
+def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, keyInManifest, compiler, cmdLine):
+    cachekey = cache.getDirectCacheKey(manifestHash, keyInManifest)
     stats.registerHeaderChangedMiss()
     returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
@@ -952,7 +1004,7 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, i
             key, objectHash = manifest.hashes.popitem()
             removedItems.append(objectHash)
         cache.removeObjects(stats, removedItems)
-        manifest.hashes[includesKey] = cachekey
+        manifest.hashes[keyInManifest] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
@@ -969,17 +1021,17 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
             grabStderr = True
             break
     if grabStderr:
-        listOfIncludes, compilerStderr = getIncludes(compilerError, sourceFile, baseDir, stripIncludes)
+        listOfIncludes, compilerStderr = getIncludes(compilerStderr, sourceFile, baseDir, stripIncludes)
     else:
         listOfIncludes, compilerOutput = getIncludes(compilerOutput, sourceFile, baseDir, stripIncludes)
     manifest = Manifest(listOfIncludes, {})
-    listOfHashes = [getRelFileHash(fileName, baseDir) for fileName in listOfIncludes]
-    includesKey = getHash(','.join(listOfHashes))
-    cachekey = getFileHash(sourceFile, includesKey + ' '.join(cmdLine))
+    listOfHeaderHashes = [getRelFileHash(fileName, baseDir) for fileName in listOfIncludes]
+    keyInManifest = cache.getKeyInManifest(listOfHeaderHashes)
+    cachekey = cache.getDirectCacheKey(manifestHash, keyInManifest)
 
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
         addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
-        manifest.hashes[includesKey] = cachekey
+        manifest.hashes[keyInManifest] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
@@ -989,20 +1041,20 @@ def get_pipe_name(cacheDir):
     return '\\\\.\\pipe\\' + cacheDir.replace(':', '-').replace('\\','-')
 
 def serveClient(hPipe):
-    buffer = ctypes.create_string_buffer(PIPE_BUFFER_SIZE)
+    buffer = wintypes.create_string_buffer(PIPE_BUFFER_SIZE)
 
     ERROR_MORE_DATA = 234
     messages = []
     for i in range(4):
         inputMessage = ''
         while True:
-            bytes_read = ctypes.c_int(0)
-            result = ctypes.windll.kernel32.ReadFile(hPipe,
+            bytes_read = wintypes.c_int(0)
+            result = windll.kernel32.ReadFile(hPipe,
                 buffer,
                 PIPE_BUFFER_SIZE,
-                ctypes.addressof(bytes_read),
-                ctypes.c_void_p(0))
-            error = ctypes.windll.kernel32.GetLastError()
+                wintypes.addressof(bytes_read),
+                wintypes.c_void_p(0))
+            error = windll.kernel32.GetLastError()
             if not result and error != ERROR_MORE_DATA:
                 print('Failed read pipe. Error {error}.'.
                        format(error=error))
@@ -1034,17 +1086,17 @@ def serveClient(hPipe):
     response = struct.pack('@III', exitCode, len(stdoutData), len(stderrData))
     response += stdoutData
     response += stderrData
-    responseBuffer = ctypes.create_string_buffer(response, len(response))
-    result = ctypes.windll.kernel32.WriteFile(hPipe,
+    responseBuffer = wintypes.create_string_buffer(response, len(response))
+    result = windll.kernel32.WriteFile(hPipe,
             responseBuffer,
             len(responseBuffer),
-            ctypes.addressof(bytes_read),
-            ctypes.c_void_p(0))
-    error = ctypes.windll.kernel32.GetLastError()
+            wintypes.addressof(bytes_read),
+            wintypes.c_void_p(0))
+    error = windll.kernel32.GetLastError()
     if not result:
         print('Failed write pipe. Error {error}.'.
                    format(error=error))
-    ctypes.windll.kernel32.FlushFileBuffers(hPipe)
+    windll.kernel32.FlushFileBuffers(hPipe)
 
 def cacodaemonMain(daemonNumber):
     cache = ObjectCache()
@@ -1059,27 +1111,27 @@ def cacodaemonMain(daemonNumber):
     PIPE_REJECT_REMOTE_CLIENTS = 0x00000008
     PIPE_UNLIMITED_INSTANCES = 255
     INVALID_HANDLE_VALUE = 0xFFFFFFFF
-    hPipe = ctypes.windll.kernel32.CreateNamedPipeW(ctypes.c_wchar_p(pipeName),
-        ctypes.c_int(PIPE_ACCESS_DUPLEX),
-        ctypes.c_int(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS),
-        ctypes.c_int(PIPE_UNLIMITED_INSTANCES),
-        ctypes.c_int(PIPE_BUFFER_SIZE),
-        ctypes.c_int(PIPE_BUFFER_SIZE),
-        ctypes.c_int(0),
-        ctypes.c_void_p(0))
+    hPipe = windll.kernel32.CreateNamedPipeW(wintypes.c_wchar_p(pipeName),
+        wintypes.c_int(PIPE_ACCESS_DUPLEX),
+        wintypes.c_int(PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS),
+        wintypes.c_int(PIPE_UNLIMITED_INSTANCES),
+        wintypes.c_int(PIPE_BUFFER_SIZE),
+        wintypes.c_int(PIPE_BUFFER_SIZE),
+        wintypes.c_int(0),
+        wintypes.c_void_p(0))
     if hPipe == INVALID_HANDLE_VALUE:
         print('Failed create pipe {name}. Error {error}.'.
-                format(name=pipeName, error=ctypes.windll.kernel32.GetLastError()))
+                format(name=pipeName, error=windll.kernel32.GetLastError()))
         return 1
     while True:
-        if not ctypes.windll.kernel32.ConnectNamedPipe(hPipe, 0):
+        if not windll.kernel32.ConnectNamedPipe(hPipe, 0):
             print('Failed connect pipe {name}. Error {error}.'.
-                    format(name=pipeName, error=ctypes.windll.kernel32.GetLastError()))
+                    format(name=pipeName, error=windll.kernel32.GetLastError()))
             return 1
         serveClient(hPipe)
-        if not ctypes.windll.kernel32.DisconnectNamedPipe(hPipe):
+        if not windll.kernel32.DisconnectNamedPipe(hPipe):
             print('Failed disconnect pipe {name}. Error {error}.'.
-                    format(name=pipeName, error=ctypes.windll.kernel32.GetLastError()))
+                    format(name=pipeName, error=windll.kernel32.GetLastError()))
             return 1
 
 def getDefaultDaemonCount():
@@ -1116,27 +1168,27 @@ def killCacodaemons():
     INFINITE = 0xFFFFFFFF
     for pid in pids:
         print('Terminating {pid}..'.format(pid=pid))
-        hProcess = ctypes.windll.kernel32.OpenProcess(ctypes.c_int(PROCESS_TERMINATE | SYNCHRONIZE),
-                                               ctypes.c_int(0),
-                                               ctypes.c_int(pid))
+        hProcess = windll.kernel32.OpenProcess(wintypes.c_int(PROCESS_TERMINATE | SYNCHRONIZE),
+                                               wintypes.c_int(0),
+                                               wintypes.c_int(pid))
         if not hProcess:
             print('Failed open process, error {error}'.
-                format(error=ctypes.windll.kernel32.GetLastError()))
+                format(error=windll.kernel32.GetLastError()))
             cache.unregiterDaemon(pid)
             continue
-        if not ctypes.windll.kernel32.TerminateProcess(hProcess, 1):
+        if not windll.kernel32.TerminateProcess(hProcess, 1):
             print('Failed terminate process, error {error}'.
-                format(error=ctypes.windll.kernel32.GetLastError()))
+                format(error=windll.kernel32.GetLastError()))
 
-        result = ctypes.windll.kernel32.WaitForSingleObject(
-            hProcess, ctypes.c_int(INFINITE))
+        result = windll.kernel32.WaitForSingleObject(
+            hProcess, wintypes.c_int(INFINITE))
         cache.unregiterDaemon(pid)
-        ctypes.windll.kernel32.CloseHandle(hProcess)
+        windll.kernel32.CloseHandle(hProcess)
 
 def main():
     if len(sys.argv) == 2 and sys.argv[1] == "--help":
         print """\
-    clcache.py v0.1"
+    clcache.py v3.0.1
       --help   : show this help
       -s       : print cache statistics
       -z       : reset cache statistics
@@ -1157,13 +1209,10 @@ def main():
 
     if len(sys.argv) == 3 and sys.argv[1] == "-M":
         cache = ObjectCache()
-        cfg = Configuration(cache)
-        cfg.setMaximumCacheSize(int(sys.argv[2]))
-        cfg.save()
-        lock = cacheLock(cache)
-        stats = CacheStatistics(cache, lock)
-        cache.clean(stats, cfg.maximumCacheSize())
-        stats.save()
+        with cache.lock:
+            cfg = Configuration(cache)
+            cfg.setMaximumCacheSize(int(sys.argv[2]))
+            cfg.save()
         return 0
 
     if len(sys.argv) >= 2 and sys.argv[1] == "--spawn-cacodaemons":
@@ -1183,13 +1232,19 @@ def main():
     if not compiler:
         print "Failed to locate cl.exe on PATH (and CLCACHE_CL is not set), aborting."
         return 1
+
     printTraceStatement("Found real compiler binary at '%s'" % compiler)
+
     if "CLCACHE_DISABLE" in os.environ:
-        return invokeRealCompiler(compiler, args[1:])[0]
-    exitCode, compilerOutput, compilerStderr = processCompileRequest(compiler, sys.argv)
-    sys.stdout.write(compilerOutput)
-    sys.stderr.write(compilerStderr)
-    return exitCode
+        return invokeRealCompiler(compiler, sys.argv[1:])[0]
+    try:
+        exitCode, compilerStdout, compilerStderr = processCompileRequest(compiler, sys.argv)
+        sys.stdout.write(compilerStdout)
+        sys.stderr.write(compilerStderr)
+        return exitCode
+    except LogicException as e:
+        print e
+        return 1
 
 def processCompileRequest(compiler, args):
     printTraceStatement("Parsing given commandline '%s'" % args[1:] )
@@ -1199,28 +1254,30 @@ def processCompileRequest(compiler, args):
     analysisResult, sourceFile, outputFile = analyzeCommandLine(cmdLine)
 
     if analysisResult == AnalysisResult.MultipleSourceFilesSimple:
-        return reinvokePerSourceFile(cmdLine, sourceFile)
+        return reinvokePerSourceFile(cmdLine, sourceFile), '', ''
 
     cache = ObjectCache()
-    lock = cacheLock(cache)
-    stats = CacheStatistics(cache, lock)
-
+    stats = CacheStatistics(cache)
     if analysisResult != AnalysisResult.Ok:
-        if analysisResult == AnalysisResult.NoSourceFile:
-            printTraceStatement("Cannot cache invocation as %s: no source file found" % (' '.join(cmdLine)) )
-            stats.registerCallWithoutSourceFile()
-        elif analysisResult == AnalysisResult.MultipleSourceFilesComplex:
-            printTraceStatement("Cannot cache invocation as %s: multiple source files found" % (' '.join(cmdLine)) )
-            stats.registerCallWithMultipleSourceFiles()
-        elif analysisResult == AnalysisResult.CalledWithPch:
-            printTraceStatement("Cannot cache invocation as %s: precompiled headers in use" % (' '.join(cmdLine)) )
-            stats.registerCallWithPch()
-        elif analysisResult == AnalysisResult.CalledForLink:
-            printTraceStatement("Cannot cache invocation as %s: called for linking" % (' '.join(cmdLine)) )
-            stats.registerCallForLinking()
-        stats.save()
-        return invokeRealCompiler(compiler, args[1:], captureOutput=True)
-
+        with cache.lock:
+            if analysisResult == AnalysisResult.NoSourceFile:
+                printTraceStatement("Cannot cache invocation as %s: no source file found" % (' '.join(cmdLine)) )
+                stats.registerCallWithoutSourceFile()
+            elif analysisResult == AnalysisResult.MultipleSourceFilesComplex:
+                printTraceStatement("Cannot cache invocation as %s: multiple source files found" % (' '.join(cmdLine)) )
+                stats.registerCallWithMultipleSourceFiles()
+            elif analysisResult == AnalysisResult.CalledWithPch:
+                printTraceStatement("Cannot cache invocation as %s: precompiled headers in use" % (' '.join(cmdLine)) )
+                stats.registerCallWithPch()
+            elif analysisResult == AnalysisResult.CalledForLink:
+                printTraceStatement("Cannot cache invocation as %s: called for linking" % (' '.join(cmdLine)) )
+                stats.registerCallForLinking()
+            elif analysisResult == AnalysisResult.ExternalDebugInfo:
+                printTraceStatement("Cannot cache invocation as %s: external debug information (/Zi) is not supported" % (' '.join(cmdLine)) )
+            stats.save()
+        return invokeRealCompiler(compiler, args[1:])
+    if 'CLCACHE_NODIRECT' in os.environ:
+        return processNoDirect(stats, cache, compiler, cmdLine)
     manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
     manifest = cache.getManifest(manifestHash)
     baseDir = os.environ.get('CLCACHE_BASEDIR')
@@ -1229,13 +1286,13 @@ def processCompileRequest(compiler, args):
     hasMissedHeader = False
     if manifest is not None:
         # NOTE: command line options already included in hash for manifest name
-        listOfHashes = []
+        listOfHeaderHashes = []
         for fileName in manifest.includeFiles:
             fileHash = getRelFileHash(fileName, baseDir)
             if fileHash is not None:
                 # May be if source does not use this header anymore (e.g. if that
                 # header was included through some other header, which now changed).
-                listOfHashes.append(fileHash)
+                listOfHeaderHashes.append(fileHash)
             else:
                 hasMissedHeader = True
                 break
@@ -1253,8 +1310,8 @@ def processCompileRequest(compiler, args):
         #    which is incorrect.
         if hasMissedHeader:
             return processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine, sourceFile)
-        includesKey = getHash(','.join(listOfHashes))
-        cachekey = manifest.hashes.get(includesKey)
+        keyInManifest = cache.getKeyInManifest(listOfHeaderHashes)
+        cachekey = manifest.hashes.get(keyInManifest)
         if cachekey is not None:
             if cache.hasEntry(cachekey):
                 return processCacheHit(stats, cache, outputFile, cachekey)
@@ -1262,9 +1319,39 @@ def processCompileRequest(compiler, args):
                 return processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine)
         else:
             # Some of header files changed - recompile and add to manifest
-            return processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, includesKey, compiler, cmdLine, sourceFile)
+            return processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, keyInManifest, compiler, cmdLine)
     else:
         return processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compiler, cmdLine, sourceFile)
+
+def processNoDirect(stats, cache, compiler, cmdLine):
+    cachekey = cache.computeKey(compiler, cmdLine)
+    if cache.hasEntry(cachekey):
+        with cache.lock:
+            stats.registerCacheHit()
+            stats.save()
+        printTraceStatement("Reusing cached object for key " + cachekey + " for " +
+                            "output file " + outputFile)
+        if os.path.exists(outputFile):
+            os.remove(outputFile)
+        copyOrLink(cache.cachedObjectName(cachekey), outputFile)
+        compilerStdout = cache.cachedCompilerOutput(cachekey)
+        compilerStderr = cache.cachedCompilerStderr(cachekey)
+        printTraceStatement("Finished. Exit code 0")
+        return 0, compilerStdout, compilerStderr
+    else:
+        returnCode, compilerStdout, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
+        with cache.lock:
+            stats.registerCacheMiss()
+            if returnCode == 0 and os.path.exists(outputFile):
+                printTraceStatement("Adding file " + outputFile + " to cache using " +
+                                    "key " + cachekey)
+                cache.setEntry(cachekey, outputFile, compilerStdout, compilerStderr)
+                stats.registerCacheEntry(os.path.getsize(outputFile))
+                cfg = Configuration(cache)
+                cache.clean(stats, cfg.maximumCacheSize())
+            stats.save()
+        printTraceStatement("Finished. Exit code %d" % returnCode)
+        return returnCode, compilerStdout, compilerStderr
 
 if __name__ == '__main__':
     sys.exit(main())
