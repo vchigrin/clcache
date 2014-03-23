@@ -396,10 +396,110 @@ class Configuration:
 
 class CacheStatistics:
     def __init__(self, objectCache):
-        self.objectCache = objectCache
-        with objectCache.lock:
-            self._stats = PersistentJSONDict(os.path.join(objectCache.cacheDirectory(),
-                                                          "stats.txt"))
+        # Use two dictionaries to ensure we'll grab cache lock on the smallest
+        # possible time. We collect increment _incremental_stats while possible
+        # and then merge it with stats on disk.
+        self._incremental_stats = defaultdict(int)
+        self._stats = None
+        self._objectCache = objectCache
+
+    def numCallsWithoutSourceFile(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithoutSourceFile"]
+
+    def registerCallWithoutSourceFile(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CallsWithoutSourceFile"] += 1
+
+    def numCallsWithMultipleSourceFiles(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithMultipleSourceFiles"]
+
+    def registerCallWithMultipleSourceFiles(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CallsWithMultipleSourceFiles"] += 1
+
+    def numCallsWithPch(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsWithPch"]
+
+    def registerCallWithPch(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CallsWithPch"] += 1
+
+    def numCallsForLinking(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CallsForLinking"]
+
+    def registerCallForLinking(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CallsForLinking"] += 1
+
+    def numEvictedMisses(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["EvictedMisses"]
+
+    def registerEvictedMiss(self):
+        self.registerCacheMiss()
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["EvictedMisses"] += 1
+
+    def numHeaderChangedMisses(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["HeaderChangedMisses"]
+
+    def registerHeaderChangedMiss(self):
+        self.registerCacheMiss()
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["HeaderChangedMisses"] += 1
+
+    def numSourceChangedMisses(self):
+        return self._stats["SourceChangedMisses"]
+
+    def registerSourceChangedMiss(self):
+        self.registerCacheMiss()
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["SourceChangedMisses"] += 1
+
+    def numCacheEntries(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheEntries"]
+
+    def registerCacheEntry(self, size):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CacheEntries"] += 1
+        stats["CacheSize"] += size
+
+    def currentCacheSize(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheSize"]
+
+    def setCacheSize(self, size):
+        self.ensureLoadedAndLocked()
+        self._stats["CacheSize"] = size
+
+    def numCacheHits(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheHits"]
+
+    def registerCacheHit(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CacheHits"] += 1
+
+    def numCacheMisses(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["CacheMisses"]
+
+    def registerCacheMiss(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["CacheMisses"] += 1
+
+    def ensureLoadedAndLocked(self):
+        if self._stats:
+            return
+        self._objectCache.lock.acquire()
+        self._stats = PersistentJSONDict(os.path.join(self._objectCache.cacheDirectory(),
+                                                      "stats.txt"))
         for k in ["CallsWithoutSourceFile",
                   "CallsWithMultipleSourceFiles",
                   "CallsWithPch",
@@ -410,78 +510,12 @@ class CacheStatistics:
                   "SourceChangedMisses"]:
             if not k in self._stats:
                 self._stats[k] = 0
-
-    def numCallsWithoutSourceFile(self):
-        return self._stats["CallsWithoutSourceFile"]
-
-    def registerCallWithoutSourceFile(self):
-        self._stats["CallsWithoutSourceFile"] += 1
-
-    def numCallsWithMultipleSourceFiles(self):
-        return self._stats["CallsWithMultipleSourceFiles"]
-
-    def registerCallWithMultipleSourceFiles(self):
-        self._stats["CallsWithMultipleSourceFiles"] += 1
-
-    def numCallsWithPch(self):
-        return self._stats["CallsWithPch"]
-
-    def registerCallWithPch(self):
-        self._stats["CallsWithPch"] += 1
-
-    def numCallsForLinking(self):
-        return self._stats["CallsForLinking"]
-
-    def registerCallForLinking(self):
-        self._stats["CallsForLinking"] += 1
-
-    def numEvictedMisses(self):
-        return self._stats["EvictedMisses"]
-
-    def registerEvictedMiss(self):
-        self.registerCacheMiss()
-        self._stats["EvictedMisses"] += 1
-
-    def numHeaderChangedMisses(self):
-        return self._stats["HeaderChangedMisses"]
-
-    def registerHeaderChangedMiss(self):
-        self.registerCacheMiss()
-        self._stats["HeaderChangedMisses"] += 1
-
-    def numSourceChangedMisses(self):
-        return self._stats["SourceChangedMisses"]
-
-    def registerSourceChangedMiss(self):
-        self.registerCacheMiss()
-        self._stats["SourceChangedMisses"] += 1
-
-    def numCacheEntries(self):
-        return self._stats["CacheEntries"]
-
-    def registerCacheEntry(self, size):
-        self._stats["CacheEntries"] += 1
-        self._stats["CacheSize"] += size
-
-    def currentCacheSize(self):
-        return self._stats["CacheSize"]
-
-    def setCacheSize(self, size):
-        self._stats["CacheSize"] = size
-
-    def numCacheHits(self):
-        return self._stats["CacheHits"]
-
-    def registerCacheHit(self):
-        self._stats["CacheHits"] += 1
-
-    def numCacheMisses(self):
-        return self._stats["CacheMisses"]
-
-    def registerCacheMiss(self):
-        self._stats["CacheMisses"] += 1
+        for key, value in self._incremental_stats.items():
+            self._stats[key] += value
+        self._incremental_stats = defaultdict(int)
 
     def resetCounters(self):
+        self.ensureLoadedAndLocked()
         for k in ["CallsWithoutSourceFile",
                   "CallsWithMultipleSourceFiles",
                   "CallsWithPch",
@@ -492,8 +526,10 @@ class CacheStatistics:
             self._stats[k] = 0
 
     def save(self):
-        with self.objectCache.lock:
-            self._stats.save()
+        self.ensureLoadedAndLocked()
+        self._stats.save()
+        self._objectCache.lock.release()
+        self._stats = None  # Force reload stats when we'll re-acuire lock
 
 class AnalysisResult:
     Ok, NoSourceFile, MultipleSourceFilesSimple, \
