@@ -43,7 +43,7 @@ import tempfile
 import multiprocessing
 import re
 
-HASH_ALGORITHM = hashlib.md5
+HASH_ALGORITHM = hashlib.sha1
 
 # Manifest file will have at most this number of hash lists in it. Need to avoi
 # manifests grow too large.
