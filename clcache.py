@@ -198,7 +198,7 @@ class ObjectCache:
                     nameBase, ext = os.path.splitext(file)
                     if ext != MANIFEST_MARK_EXTENSION:
                         continue
-                    self._removeEntryFromManifest(nameBase, entryHash)
+                    self._removeEntryFromManifest(nameBase, entryHash, stats)
                 rmtree(entryDir)
                 currentEntriesCount -= 1
                 currentSize -= stat.st_size
@@ -206,7 +206,7 @@ class ObjectCache:
                     break
             stats.setCacheSize(currentSize, currentEntriesCount)
 
-    def _removeEntryFromManifest(self, manifestHash, entryHash):
+    def _removeEntryFromManifest(self, manifestHash, entryHash, stats):
         manifest = self.getManifest(manifestHash)
         if not manifest:
             return
@@ -215,6 +215,7 @@ class ObjectCache:
                 del manifest.hashes[keyInManifest]
         if len(manifest.hashes) == 0:
             self.removeManifest(manifestHash)
+            stats.removeManifest()
         else:
             self.setManifest(manifestHash, manifest)
 
@@ -300,12 +301,16 @@ class ObjectCache:
                         manifestHash + MANIFEST_MARK_EXTENSION)
                 open(manifestMarkFileName, 'w').close()
 
+    # Returns true if this is new manifest
     def setManifest(self, manifestHash, manifest):
         with self.lock:
             if not os.path.exists(self._manifestDir(manifestHash)):
                 os.makedirs(self._manifestDir(manifestHash))
-            with open(self._manifestName(manifestHash), 'wb') as outFile:
+            fileName = self._manifestName(manifestHash)
+            result = not os.path.exists(fileName)
+            with open(fileName, 'wb') as outFile:
                 pickle.dump(manifest, outFile)
+            return result
 
     def removeManifest(self, manifestHash):
         with self.lock:
@@ -514,6 +519,18 @@ class CacheStatistics:
         stats["CacheEntries"] += 1
         stats["CacheSize"] += size
 
+    def numManifests(self):
+        self.ensureLoadedAndLocked()
+        return self._stats["ManifestsCount"]
+
+    def registerManifest(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["ManifestsCount"] += 1
+
+    def removeManifest(self):
+        stats = self._stats if self._stats else self._incremental_stats
+        stats["ManifestsCount"] -= 1
+
     def currentCacheSize(self):
         self.ensureLoadedAndLocked()
         return self._stats["CacheSize"]
@@ -552,7 +569,7 @@ class CacheStatistics:
                   "CacheEntries", "CacheSize",
                   "CacheHits", "CacheMisses",
                   "EvictedMisses", "HeaderChangedMisses",
-                  "SourceChangedMisses"]:
+                  "SourceChangedMisses", "ManifestsCount"]:
             if not k in self._stats:
                 self._stats[k] = 0
         for key, value in self._incremental_stats.items():
@@ -982,6 +999,7 @@ def printStatistics():
   cache size               : %d bytes
   maximum cache size       : %d bytes
   cache entries            : %d
+  manifests count          : %d
   cache hits               : %d
   cache misses             : %d
   called for linking       : %d
@@ -996,6 +1014,7 @@ def printStatistics():
            stats.currentCacheSize(),
            cfg.maximumCacheSize(),
            stats.numCacheEntries(),
+           stats.numManifests(),
            stats.numCacheHits(),
            stats.numCacheMisses(),
            stats.numCallsForLinking(),
@@ -1086,7 +1105,8 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, k
             removedItems.append(objectHash)
         cache.removeObjects(stats, removedItems)
         manifest.hashes[keyInManifest] = cachekey
-        cache.setManifest(manifestHash, manifest)
+        if cache.setManifest(manifestHash, manifest):
+            stats.registerManifest()
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
     return returnCode, compilerOutput, compilerStderr
@@ -1113,7 +1133,8 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
         addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey, manifestHash)
         manifest.hashes[keyInManifest] = cachekey
-        cache.setManifest(manifestHash, manifest)
+        if cache.setManifest(manifestHash, manifest):
+            stats.registerManifest()
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
     return returnCode, compilerOutput, compilerStderr
