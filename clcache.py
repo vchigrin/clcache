@@ -177,6 +177,7 @@ class ObjectCache:
             currentSize = stats.currentCacheSize()
             if currentSize < maximumSize:
                 return
+            currentEntriesCount = stats.numCacheEntries()
 
             # Free at least 10% to avoid cleaning up too often which
             # is a big performance hit with large caches.
@@ -199,11 +200,11 @@ class ObjectCache:
                         continue
                     self._removeEntryFromManifest(nameBase, entryHash)
                 rmtree(entryDir)
+                currentEntriesCount -= 1
                 currentSize -= stat.st_size
                 if currentSize < effectiveMaximumSize:
                     break
-
-            stats.setCacheSize(currentSize)
+            stats.setCacheSize(currentSize, currentEntriesCount)
 
     def _removeEntryFromManifest(self, manifestHash, entryHash):
         manifest = self.getManifest(manifestHash)
@@ -222,6 +223,7 @@ class ObjectCache:
             return
         with self.lock:
             currentSize = stats.currentCacheSize()
+            currentEntriesCount = stats.numCacheEntries()
             for hash in removedObjects:
                 dirPath = self._cacheEntryDir(hash)
                 if not os.path.exists(dirPath):
@@ -233,7 +235,8 @@ class ObjectCache:
                     fileStat = os.stat(objectPath)
                     currentSize -= fileStat.st_size
                 rmtree(dirPath)
-            stats.setCacheSize(currentSize)
+                currentEntriesCount -= 1
+            stats.setCacheSize(currentSize, currentEntriesCount)
 
     def getManifestHash(self, compilerBinary, commandLine, sourceFile):
         stat = os.stat(compilerBinary)
@@ -515,9 +518,10 @@ class CacheStatistics:
         self.ensureLoadedAndLocked()
         return self._stats["CacheSize"]
 
-    def setCacheSize(self, size):
+    def setCacheSize(self, size, entriesCount):
         self.ensureLoadedAndLocked()
         self._stats["CacheSize"] = size
+        self._stats["CacheEntries"] = entriesCount
 
     def numCacheHits(self):
         self.ensureLoadedAndLocked()
