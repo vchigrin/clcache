@@ -73,6 +73,14 @@ VERIFIED_COMPILER_HINTS = set()
 # speed up build process.
 HEADER_HASH_CACHE = {}
 
+# When clearing objects from cache we need to remove also orphaned manifests.
+# Without this manifest count will grow infinitely consuming disk space
+# and slowing further cache clearing.
+# So, we add empty "mark" files to the directories with cache entries.
+# By names of these "mark" files we can determine cache key of corresponding
+# manifest and update/remove it during cache clearing.
+MANIFEST_MARK_EXTENSION = '.mark'
+
 # Path - either absolute or relative to BASE_DIR (if possible) path,
 # mtime - modification time of file. We need use it since some headers may be
 # re-generated during build process.
@@ -182,12 +190,32 @@ class ObjectCache:
             objectInfos.sort(key=lambda t: t[0].st_atime)
 
             for stat, fn in objectInfos:
-                rmtree(os.path.split(fn)[0])
+                entryDir = os.path.split(fn)[0]
+                entryHash = os.path.basename(entryDir)
+                # Find all manifests and remove link from them
+                for file in os.listdir(entryDir):
+                    nameBase, ext = os.path.splitext(file)
+                    if ext != MANIFEST_MARK_EXTENSION:
+                        continue
+                    self._removeEntryFromManifest(nameBase, entryHash)
+                rmtree(entryDir)
                 currentSize -= stat.st_size
                 if currentSize < effectiveMaximumSize:
                     break
 
             stats.setCacheSize(currentSize)
+
+    def _removeEntryFromManifest(self, manifestHash, entryHash):
+        manifest = self.getManifest(manifestHash)
+        if not manifest:
+            return
+        for keyInManifest, cacheKey in manifest.hashes.items():
+            if cacheKey == entryHash:
+                del manifest.hashes[keyInManifest]
+        if len(manifest.hashes) == 0:
+            self.removeManifest(manifestHash)
+        else:
+            self.setManifest(manifestHash, manifest)
 
     def removeObjects(self, stats, removedObjects):
         if len(removedObjects) == 0:
@@ -252,7 +280,7 @@ class ObjectCache:
         with self.lock:
             return os.path.exists(self.cachedObjectName(key)) or os.path.exists(self._cachedCompilerOutputName(key))
 
-    def setEntry(self, key, objectFileName, compilerOutput, compilerStderr):
+    def setEntry(self, key, objectFileName, compilerOutput, compilerStderr, manifestHash):
         with self.lock:
             if not os.path.exists(self._cacheEntryDir(key)):
                 os.makedirs(self._cacheEntryDir(key))
@@ -261,6 +289,13 @@ class ObjectCache:
             open(self._cachedCompilerOutputName(key), 'w').write(compilerOutput)
             if compilerStderr != '':
                 open(self._cachedCompilerStderrName(key), 'w').write(compilerStderr)
+            if manifestHash:
+                # Save hash of the parent manifest to ensure reference will
+                # be removed from it during cache cleaning.
+                manifestMarkFileName = os.path.join(
+                        self._cacheEntryDir(key),
+                        manifestHash + MANIFEST_MARK_EXTENSION)
+                open(manifestMarkFileName, 'w').close()
 
     def setManifest(self, manifestHash, manifest):
         with self.lock:
@@ -268,6 +303,12 @@ class ObjectCache:
                 os.makedirs(self._manifestDir(manifestHash))
             with open(self._manifestName(manifestHash), 'wb') as outFile:
                 pickle.dump(manifest, outFile)
+
+    def removeManifest(self, manifestHash):
+        with self.lock:
+            fileName = self._manifestName(manifestHash)
+            if os.path.exists(fileName):
+                os.remove(fileName)
 
     def getManifest(self, manifestHash):
         with self.lock:
@@ -995,10 +1036,10 @@ def getIncludes(compilerOutput, sourceFile, baseDir, strip):
     else:
         return list(includesSet), compilerOutput
 
-def addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey):
+def addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey, manifestHash):
     printTraceStatement("Adding file " + outputFile + " to cache using " +
                         "key " + cachekey)
-    cache.setEntry(cachekey, outputFile, compilerOutput, compilerStderr)
+    cache.setEntry(cachekey, outputFile, compilerOutput, compilerStderr, manifestHash)
     if outputFile != '':
         stats.registerCacheEntry(os.path.getsize(outputFile))
         cfg = Configuration(cache)
@@ -1018,13 +1059,13 @@ def processCacheHit(stats, cache, outputFile, cachekey):
     printTraceStatement("Finished. Exit code 0")
     return 0, compilerOutput, compilerStderr
 
-def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine):
+def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine, manifestHash):
     stats.registerEvictedMiss()
     printTraceStatement("Cached object already evicted for key " + cachekey + " for " +
                         "output file " + outputFile)
     returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
-       addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
+       addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cacheke, manifestHash)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
     return returnCode, compilerOutput, compilerStderr
@@ -1034,7 +1075,7 @@ def processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, k
     stats.registerHeaderChangedMiss()
     returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
-        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
+        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey, manifestHash)
         removedItems = []
         while len(manifest.hashes) >= MAX_MANIFEST_HASHES:
             key, objectHash = manifest.hashes.popitem()
@@ -1066,7 +1107,7 @@ def processNoManifestMiss(stats, cache, outputFile, manifestHash, baseDir, compi
     cachekey = cache.getDirectCacheKey(manifestHash, keyInManifest)
 
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
-        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey)
+        addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey, manifestHash)
         manifest.hashes[keyInManifest] = cachekey
         cache.setManifest(manifestHash, manifest)
     stats.save()
@@ -1352,7 +1393,7 @@ def processCompileRequest(compiler, args):
             if cache.hasEntry(cachekey):
                 return processCacheHit(stats, cache, outputFile, cachekey)
             else:
-                return processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine)
+                return processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine, manifestHash)
         else:
             # Some of header files changed - recompile and add to manifest
             return processHeaderChangedMiss(stats, cache, outputFile, manifest, manifestHash, keyInManifest, compiler, cmdLine)
@@ -1381,7 +1422,7 @@ def processNoDirect(stats, cache, compiler, cmdLine):
             if returnCode == 0 and os.path.exists(outputFile):
                 printTraceStatement("Adding file " + outputFile + " to cache using " +
                                     "key " + cachekey)
-                cache.setEntry(cachekey, outputFile, compilerStdout, compilerStderr)
+                cache.setEntry(cachekey, outputFile, compilerStdout, compilerStderr, None)
                 stats.registerCacheEntry(os.path.getsize(outputFile))
                 cfg = Configuration(cache)
                 cache.clean(stats, cfg.maximumCacheSize())
