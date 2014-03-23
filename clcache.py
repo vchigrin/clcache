@@ -109,21 +109,24 @@ class ObjectCacheLock:
             wintypes.c_int(0),
             unicode(mutexName))
         self._timeoutMs = timeoutMs
-        self._acquired = False
+        # We use this class only for inter-process synchronization, so
+        # we can use local variable here to avoid too many calls of system APIs
+        self._acquire_count = 0
         assert self._mutex
 
     def __enter__(self):
-        if not self._acquired:
-            self.acquire()
+        self.acquire()
 
     def __exit__(self, type, value, traceback):
-        if self._acquired:
-            self.release()
+        self.release()
 
     def __del__(self):
         windll.kernel32.CloseHandle(self._mutex)
 
     def acquire(self):
+        self._acquire_count += 1
+        if self._acquire_count > 1:
+            return
         WAIT_ABANDONED = 0x00000080
         result = windll.kernel32.WaitForSingleObject(
             self._mutex, wintypes.c_int(self._timeoutMs))
@@ -132,11 +135,12 @@ class ObjectCacheLock:
                 result=result,
                 error=windll.kernel32.GetLastError())
             raise ObjectCacheLockException(errorString)
-        self._acquired = True
 
     def release(self):
+        self._acquire_count -= 1
+        if self._acquire_count > 0:
+            return
         windll.kernel32.ReleaseMutex(self._mutex)
-        self._acquired = False
 
 class ObjectCache:
     def __init__(self):
