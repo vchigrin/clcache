@@ -149,7 +149,7 @@ class ObjectCache:
         except KeyError:
             self.dir = os.path.join(os.path.expanduser("~"), "clcache")
         lockName = self.cacheDirectory().replace(':', '-').replace('\\', '-')
-        self.lock = ObjectCacheLock(lockName, 10 * 1000)
+        self.lock = ObjectCacheLock(lockName, ObjectCacheLock.INFINITE)
 
         self.tempDir = os.path.join(self.dir, '.temp')
         self.daemonsDir = os.path.join(self.dir, '.daemons')
