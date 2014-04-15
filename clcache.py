@@ -286,7 +286,15 @@ class ObjectCache:
 
     def hasEntry(self, key):
         with self.lock:
-            return os.path.exists(self.cachedObjectName(key)) or os.path.exists(self._cachedCompilerOutputName(key))
+            objectFileName = self.cachedObjectName(key)
+            if os.path.exists(objectFileName):
+                # Sometimes empty .obj files appears in cache (e.g. if computer is incorrectly
+                # turned off during build process). Do not use these files, since they will fail
+                # the build. They will be evicted normally during some cache clean.
+                return os.path.getsize(objectFileName) > 0
+            # If there are no .obj file, it may appear that we just cached compiler output
+            # (e.g. if this is cached preprocessor invocation).
+            return os.path.exists(self._cachedCompilerOutputName(key))
 
     def setEntry(self, key, objectFileName, compilerOutput, compilerStderr, manifestHash):
         with self.lock:
