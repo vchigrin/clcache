@@ -284,7 +284,7 @@ class ObjectCache:
         # set of includes.
         return getHash(manifestHash + keyInManifest)
 
-    def hasEntry(self, key):
+    def hasEntry(self, key, needObject):
         with self.lock:
             objectFileName = self.cachedObjectName(key)
             if os.path.exists(objectFileName):
@@ -292,6 +292,8 @@ class ObjectCache:
                 # turned off during build process). Do not use these files, since they will fail
                 # the build. They will be evicted normally during some cache clean.
                 return os.path.getsize(objectFileName) > 0
+            if needObject:
+                return False
             # If there are no .obj file, it may appear that we just cached compiler output
             # (e.g. if this is cached preprocessor invocation).
             return os.path.exists(self._cachedCompilerOutputName(key))
@@ -1434,7 +1436,7 @@ def processCompileRequest(compiler, args):
         keyInManifest = cache.getKeyInManifest(listOfHeaderHashes)
         cachekey = manifest.hashes.get(keyInManifest)
         if cachekey is not None:
-            if cache.hasEntry(cachekey):
+            if cache.hasEntry(cachekey, outputFile):
                 return processCacheHit(stats, cache, outputFile, cachekey)
             else:
                 return processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine, manifestHash)
@@ -1446,7 +1448,7 @@ def processCompileRequest(compiler, args):
 
 def processNoDirect(stats, cache, compiler, cmdLine):
     cachekey = cache.computeKey(compiler, cmdLine)
-    if cache.hasEntry(cachekey):
+    if cache.hasEntry(cachekey, outputFile):
         with cache.lock:
             stats.registerCacheHit()
             stats.save()
