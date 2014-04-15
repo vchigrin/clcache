@@ -361,7 +361,14 @@ class ObjectCache:
 
     def unregiterDaemon(self, daemonPid):
         with self.lock:
-            rmtree(self.getDaemonDir(daemonPid))
+            daemonDir = self.getDaemonDir(daemonPid)
+            print 'DAEMON STDOUT:'
+            with open(os.path.join(daemonDir, 'stdout.txt'), 'r') as f:
+                sys.stdout.write(f.read())
+            print 'DAEMON STDERR:'
+            with open(os.path.join(daemonDir, 'stderr.txt'), 'r') as f:
+                sys.stdout.write(f.read())
+            rmtree(daemonDir)
 
     def getAllDaemonPids(self):
         with self.lock:
