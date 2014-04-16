@@ -1109,7 +1109,7 @@ def processObjectEvicted(stats, cache, outputFile, cachekey, compiler, cmdLine, 
                         "output file " + outputFile)
     returnCode, compilerOutput, compilerStderr = invokeRealCompiler(compiler, cmdLine, captureOutput=True)
     if returnCode == 0 and (outputFile == '' or os.path.exists(outputFile)):
-       addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cacheke, manifestHash)
+       addObjectToCache(stats, cache, outputFile, compilerOutput, compilerStderr, cachekey, manifestHash)
     stats.save()
     printTraceStatement("Finished. Exit code %d" % returnCode)
     return returnCode, compilerOutput, compilerStderr
