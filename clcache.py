@@ -369,15 +369,20 @@ class ObjectCache:
         with self.lock:
             os.makedirs(self.getDaemonDir(daemonPid))
 
+    def _outputFile(self, daemonDir, fileName):
+        print 'DAEMON ' + fileName
+        filePath = os.path.join(daemonDir, fileName)
+        if os.path.exists(filePath):
+            with open(filePath, 'r') as f:
+                sys.stdout.write(f.read())
+        else:
+            print '<No file present>'
+
     def unregiterDaemon(self, daemonPid):
         with self.lock:
             daemonDir = self.getDaemonDir(daemonPid)
-            print 'DAEMON STDOUT:'
-            with open(os.path.join(daemonDir, 'stdout.txt'), 'r') as f:
-                sys.stdout.write(f.read())
-            print 'DAEMON STDERR:'
-            with open(os.path.join(daemonDir, 'stderr.txt'), 'r') as f:
-                sys.stdout.write(f.read())
+            self._outputFile(daemonDir, 'stdout.txt')
+            self._outputFile(daemonDir, 'stderr.txt')
             rmtree(daemonDir)
 
     def getAllDaemonPids(self):
