@@ -717,8 +717,13 @@ def extractArgument(line, start, end):
     if line[start] == '"' and line[end-1] == '"' and start != (end-1):
         start += 1
         end -= 1
+    # Strings like -D"MAX_REPORT_COUNT=L\"999\"" should be replaced by
+    #  -DMAX_REPORT_COUNT=L\"999\"
+    unescaped_result = line[start:end]
+    if line[end-1] == '"' and (end-start) > 3 and line[start:start+3] == '-D"':
+        unescaped_result = '-D' + line[start+3:end-1]
     # Unescape quotes.
-    return line[start:end].replace('\\"','"').strip()
+    return unescaped_result.replace('\\"','"').strip()
 
 def splitCommandsFile(line):
     # Note, we must treat lines in quotes as one argument. We do not use shlex

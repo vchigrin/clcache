@@ -23,6 +23,10 @@ class TestSplitCommandsFile(unittest.TestCase):
         self._genericTest('"-DWEBRTC_SVNREVISION=\\"Unavailable(issue687)\\"" -D_WIN32_WINNT=0x0602',
                           ['-DWEBRTC_SVNREVISION="Unavailable(issue687)"', '-D_WIN32_WINNT=0x0602'])
 
+    def testEscapedDefine(self):
+        self._genericTest('-D"MAX_REPORT_COUNT=L\\"999\\"" -D_WIN32_WINNT=0x0602',
+                          ['-DMAX_REPORT_COUNT=L"999"', '-D_WIN32_WINNT=0x0602'])
+
 
 if __name__ == '__main__':
     unittest.main()
