@@ -788,7 +788,7 @@ def parseCommandLine(cmdline):
                             'D', 'U', 'I', 'Zp', 'vm',
                             'MP', 'Tc', 'V', 'wd', 'wo',
                             'W', 'Yc', 'Yl', 'Tp', 'we',
-                            'Yu', 'Zm', 'F', 'Fi']
+                            'Yu', 'Zm', 'F', 'Fi', 'Xclang']
     options = defaultdict(list)
     responseFile = ""
     sourceFiles = []
