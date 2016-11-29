@@ -1411,7 +1411,15 @@ def processCompileRequest(compiler, args):
         return invokeRealCompiler(compiler, args[1:])
     if 'CLCACHE_NODIRECT' in os.environ:
         return processNoDirect(stats, cache, compiler, cmdLine)
-    manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
+    try:
+        manifestHash = cache.getManifestHash(compiler, cmdLine, sourceFile)
+    except IOError as ex:
+        # May occur when source file, being compiled, is absent.
+        returnCode = 1
+        compilerOutput = ""
+        compilerStderr = str(ex)
+        return returnCode, compilerOutput, compilerStderr
+
     manifest = cache.getManifest(manifestHash)
     baseDir = os.environ.get('CLCACHE_BASEDIR')
     if baseDir and not baseDir.endswith(os.path.sep):
